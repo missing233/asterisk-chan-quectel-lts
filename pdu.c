@@ -664,6 +664,9 @@ EXPORT_DEF int pdu_parse_sca(uint8_t *pdu, size_t pdu_length, char *sca, size_t 
 {
 	int i = 0;
 	int sca_digits = (pdu[i++] - 1) * 2;
+	if (pdu[i-1] == 0) {
+    	return i;
+	}
 	int field_len = pdu_parse_number(pdu + i, pdu_length - i, sca_digits, sca, sca_len);
 	if (field_len <= 0) {
 		chan_quectel_err = E_INVALID_SCA;

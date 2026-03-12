@@ -154,6 +154,14 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,struct pvt *
 		dev, (stream == SND_PCM_STREAM_CAPTURE) ? "capture" : "playback",
 		(unsigned long) period_size, (unsigned long) buffer_size);
 
+	if (stream == SND_PCM_STREAM_CAPTURE) {
+		pvt->uac_capture_period = period_size;
+		pvt->uac_capture_buffer = buffer_size;
+	} else {
+		pvt->uac_playback_period = period_size;
+		pvt->uac_playback_buffer = buffer_size;
+	}
+
 	swparams = ast_alloca(snd_pcm_sw_params_sizeof());
 	memset(swparams, 0, snd_pcm_sw_params_sizeof());
 	snd_pcm_sw_params_current(handle, swparams);
@@ -231,6 +239,17 @@ static int soundcard_init(struct pvt * pvt)
 	pvt->uac_readpos = 0;
 	pvt->uac_readleft = FRAME_SIZE2;
 	pvt->uac_write_len = 0;
+	rb_init(&pvt->uac_tx_rb, pvt->uac_tx_buf, sizeof(pvt->uac_tx_buf));
+	rb_init(&pvt->uac_rx_rb, pvt->uac_rx_buf, sizeof(pvt->uac_rx_buf));
+	memset(pvt->uac_rx_assem_buf, 0, sizeof(pvt->uac_rx_assem_buf));
+	memset(pvt->uac_last_tx_frame, 0, sizeof(pvt->uac_last_tx_frame));
+	memset(pvt->uac_last_rx_frame, 0, sizeof(pvt->uac_last_rx_frame));
+	pvt->uac_have_last_tx = 0;
+	pvt->uac_have_last_rx = 0;
+	pvt->uac_tx_plc_left = 0;
+	pvt->uac_rx_plc_left = 0;
+	pvt->uac_target_frames = 1;
+	pvt->uac_stable_ticks = 0;
 	snd_pcm_prepare(pvt->icard);
 	snd_pcm_prepare(pvt->ocard);
 
@@ -257,6 +276,17 @@ int soundcard_reopen(struct pvt *pvt)
 	pvt->uac_readpos = 0;
 	pvt->uac_readleft = FRAME_SIZE2;
 	pvt->uac_write_len = 0;
+	rb_init(&pvt->uac_tx_rb, pvt->uac_tx_buf, sizeof(pvt->uac_tx_buf));
+	rb_init(&pvt->uac_rx_rb, pvt->uac_rx_buf, sizeof(pvt->uac_rx_buf));
+	memset(pvt->uac_rx_assem_buf, 0, sizeof(pvt->uac_rx_assem_buf));
+	memset(pvt->uac_last_tx_frame, 0, sizeof(pvt->uac_last_tx_frame));
+	memset(pvt->uac_last_rx_frame, 0, sizeof(pvt->uac_last_rx_frame));
+	pvt->uac_have_last_tx = 0;
+	pvt->uac_have_last_rx = 0;
+	pvt->uac_tx_plc_left = 0;
+	pvt->uac_rx_plc_left = 0;
+	pvt->uac_target_frames = 1;
+	pvt->uac_stable_ticks = 0;
 
 	ast_verb(2, "[%s] Reopening UAC sound card\n", PVT_ID(pvt));
 
@@ -1058,13 +1088,13 @@ static void discovery_stop(public_state_t * state)
 #/* */
 EXPORT_DEF void pvt_on_create_1st_channel(struct pvt* pvt)
 {
-        if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0) {
-	mixb_init (&pvt->a_write_mixb, pvt->a_write_buf, sizeof (pvt->a_write_buf));
-//	rb_init (&pvt->a_write_rb, pvt->a_write_buf, sizeof (pvt->a_write_buf));
+	if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0) {
+		mixb_init (&pvt->a_write_mixb, pvt->a_write_buf, sizeof (pvt->a_write_buf));
+//		rb_init (&pvt->a_write_rb, pvt->a_write_buf, sizeof (pvt->a_write_buf));
+	}
 
 	if(!pvt->a_timer)
 		pvt->a_timer = ast_timer_open ();
-                                                       }
 
 /* FIXME: do on each channel switch */
 	if(pvt->dsp)

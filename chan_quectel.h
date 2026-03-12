@@ -20,7 +20,7 @@
 #include "ast_compat.h"				/* asterisk compatibility fixes */
 
 #include "mixbuffer.h"				/* struct mixbuffer */
-//#include "ringbuffer.h"				/* struct ringbuffer */
+#include "ringbuffer.h"				/* struct ringbuffer */
 #include "cpvt.h"				/* struct cpvt */
 #include "export.h"				/* EXPORT_DECL EXPORT_DEF */
 #include "dc_config.h"				/* pvt_config_t */
@@ -155,6 +155,23 @@ typedef struct pvt
 	size_t			uac_write_len;			/*!< pending UAC playback bytes in a_write_buf */
 	int				uac_readpos;			/*!< accumulated UAC capture samples */
 	int				uac_readleft;			/*!< remaining UAC capture samples for a full frame */
+	char			uac_rx_assem_buf[FRAME_SIZE];	/*!< temporary UAC capture frame assembly buffer */
+	char			uac_tx_buf[FRAME_SIZE * 6];	/*!< adaptive UAC uplink queue storage */
+	struct ringbuffer	uac_tx_rb;			/*!< adaptive UAC uplink queue */
+	char			uac_rx_buf[FRAME_SIZE * 6];	/*!< adaptive UAC downlink queue storage */
+	struct ringbuffer	uac_rx_rb;			/*!< adaptive UAC downlink queue */
+	char			uac_last_tx_frame[FRAME_SIZE];	/*!< last transmitted UAC uplink frame for PLC */
+	char			uac_last_rx_frame[FRAME_SIZE];	/*!< last captured UAC downlink frame for PLC */
+	unsigned int	uac_have_last_tx:1;		/*!< uplink PLC history available */
+	unsigned int	uac_have_last_rx:1;		/*!< downlink PLC history available */
+	unsigned int	uac_tx_plc_left:2;		/*!< remaining uplink PLC frames */
+	unsigned int	uac_rx_plc_left:2;		/*!< remaining downlink PLC frames */
+	unsigned int	uac_target_frames:2;		/*!< adaptive target buffering depth, in 20ms frames */
+	unsigned int	uac_stable_ticks;		/*!< consecutive stable 20ms ticks */
+	snd_pcm_uframes_t	uac_capture_period;		/*!< negotiated UAC capture period size */
+	snd_pcm_uframes_t	uac_capture_buffer;		/*!< negotiated UAC capture buffer size */
+	snd_pcm_uframes_t	uac_playback_period;		/*!< negotiated UAC playback period size */
+	snd_pcm_uframes_t	uac_playback_buffer;		/*!< negotiated UAC playback buffer size */
 	struct mixbuffer	a_write_mixb;			/*!< audio mix buffer */
 //	struct ringbuffer	a_write_rb;			/*!< audio ring buffer */
 
