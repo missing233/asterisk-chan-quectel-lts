@@ -42,6 +42,8 @@
 int soundcard_reopen(struct pvt *pvt);
 static char silence_frame[FRAME_SIZE];
 static void uac_reset_runtime(struct pvt *pvt);
+static void uac_diag_reset(struct pvt *pvt);
+static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char *reason);
 
 #/* */
 static int parse_dial_string(char * dialstr, const char** number, int * opts)
@@ -429,6 +431,35 @@ static void activate_call(struct cpvt* cpvt)
 	}
 }
 
+static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char *reason)
+{
+	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0)
+		return;
+
+	ast_verb(3,
+		"[%s] UAC diag summary reason=%s call_idx=%d dtmf_begin=%u dtmf_drop_pending=%u dtmf_send_ok=%u dtmf_send_ok_sys=%u dtmf_send_ok_late=%u dtmf_send_err=%u dtmf_send_err_sys=%u dtmf_send_err_late=%u tx_rb_drop=%u rx_rb_drop=%u capture_prepare=%u capture_start=%u capture_avail_recover=%u capture_read_recover=%u playback_prepare=%u playback_avail_recover=%u playback_write_recover=%u capture_degraded=%u playback_degraded=%u\n",
+		PVT_ID(pvt), reason ? reason : "unknown", cpvt ? cpvt->call_idx : -1,
+		pvt->uac_diag_dtmf_begin,
+		pvt->uac_diag_dtmf_drop_pending,
+		pvt->uac_diag_dtmf_send_ok,
+		pvt->uac_diag_dtmf_send_ok_sys,
+		pvt->uac_diag_dtmf_send_ok_late,
+		pvt->uac_diag_dtmf_send_err,
+		pvt->uac_diag_dtmf_send_err_sys,
+		pvt->uac_diag_dtmf_send_err_late,
+		pvt->uac_diag_tx_rb_drop,
+		pvt->uac_diag_rx_rb_drop,
+		pvt->uac_diag_capture_prepare,
+		pvt->uac_diag_capture_start,
+		pvt->uac_diag_capture_avail_recover,
+		pvt->uac_diag_capture_read_recover,
+		pvt->uac_diag_playback_prepare,
+		pvt->uac_diag_playback_avail_recover,
+		pvt->uac_diag_playback_write_recover,
+		pvt->uac_diag_capture_degraded_ticks,
+		pvt->uac_diag_playback_degraded_ticks);
+}
+
 #/* we has 2 case of call this function, when local side want terminate call and when called for cleanup after remote side alreay terminate call, CEND received and cpvt destroyed */
 static int channel_hangup (struct ast_channel* channel)
 {
@@ -453,6 +484,8 @@ static int channel_hangup (struct ast_channel* channel)
 
 		}
 
+		pvt->uac_diag_dtmf_drop_pending += at_queue_drop_pending_dtmf(pvt, cpvt);
+		uac_diag_log_summary(pvt, cpvt, "hangup");
 		disactivate_call (cpvt);
 
 		/* drop cpvt->channel reference */
@@ -515,9 +548,12 @@ static int channel_digit_begin (struct ast_channel* channel, char digit)
 	ast_mutex_lock (&pvt->lock);
 
 	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") == 0) {
+		pvt->uac_diag_dtmf_begin++;
 		if (pvt->uac_target_frames < 2)
 			pvt->uac_target_frames = 2;
 		pvt->uac_stable_ticks = 0;
+		ast_verb(3, "[%s] UAC diag DTMF begin digit=%c call_idx=%d target=%u\n",
+			PVT_ID(pvt), digit, cpvt->call_idx, pvt->uac_target_frames);
 	}
 
 	rv = at_enqueue_dtmf(cpvt, digit);
@@ -778,6 +814,29 @@ static snd_pcm_uframes_t uac_pcm_target_fill(const struct pvt *pvt)
 	return want;
 }
 
+static void uac_diag_reset(struct pvt *pvt)
+{
+	pvt->uac_diag_dtmf_begin = 0;
+	pvt->uac_diag_dtmf_drop_pending = 0;
+	pvt->uac_diag_dtmf_send_ok = 0;
+	pvt->uac_diag_dtmf_send_ok_sys = 0;
+	pvt->uac_diag_dtmf_send_ok_late = 0;
+	pvt->uac_diag_dtmf_send_err = 0;
+	pvt->uac_diag_dtmf_send_err_sys = 0;
+	pvt->uac_diag_dtmf_send_err_late = 0;
+	pvt->uac_diag_tx_rb_drop = 0;
+	pvt->uac_diag_rx_rb_drop = 0;
+	pvt->uac_diag_capture_prepare = 0;
+	pvt->uac_diag_capture_start = 0;
+	pvt->uac_diag_capture_avail_recover = 0;
+	pvt->uac_diag_capture_read_recover = 0;
+	pvt->uac_diag_playback_prepare = 0;
+	pvt->uac_diag_playback_avail_recover = 0;
+	pvt->uac_diag_playback_write_recover = 0;
+	pvt->uac_diag_capture_degraded_ticks = 0;
+	pvt->uac_diag_playback_degraded_ticks = 0;
+}
+
 static void uac_raise_target(struct pvt *pvt, const char *reason)
 {
 	unsigned int old = pvt->uac_target_frames;
@@ -925,6 +984,7 @@ static void uac_reset_runtime(struct pvt *pvt)
 	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
 	pvt->uac_stable_ticks = 0;
+	uac_diag_reset(pvt);
 }
 
 static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
@@ -939,8 +999,12 @@ static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
 	if (pvt->uac_have_last_tx)
 		uac_sanitize_edge_from_prev(pvt->uac_last_tx_frame, frame, pvt->uac_tx_plc_left != 0);
 
-	while (rb_free(&pvt->uac_tx_rb) < FRAME_SIZE)
+	while (rb_free(&pvt->uac_tx_rb) < FRAME_SIZE) {
 		rb_read_upd(&pvt->uac_tx_rb, FRAME_SIZE);
+		pvt->uac_diag_tx_rb_drop++;
+		ast_verb(3, "[%s] UAC diag TX rb drop old frame target=%u used=%lu\n",
+			PVT_ID(pvt), pvt->uac_target_frames, (unsigned long)rb_used(&pvt->uac_tx_rb));
+	}
 	rb_write(&pvt->uac_tx_rb, frame, FRAME_SIZE);
 	uac_trim_queue(&pvt->uac_tx_rb, keep);
 
@@ -956,8 +1020,12 @@ static void uac_queue_rx_frame(struct pvt *pvt, void *data)
 	if (pvt->uac_have_last_rx)
 		uac_sanitize_edge_from_prev(pvt->uac_last_rx_frame, frame, aggressive);
 
-	while (rb_free(&pvt->uac_rx_rb) < FRAME_SIZE)
+	while (rb_free(&pvt->uac_rx_rb) < FRAME_SIZE) {
 		rb_read_upd(&pvt->uac_rx_rb, FRAME_SIZE);
+		pvt->uac_diag_rx_rb_drop++;
+		ast_verb(3, "[%s] UAC diag RX rb drop old frame used=%lu\n",
+			PVT_ID(pvt), (unsigned long)rb_used(&pvt->uac_rx_rb));
+	}
 	rb_write(&pvt->uac_rx_rb, data, FRAME_SIZE);
 
 	memcpy(pvt->uac_last_rx_frame, frame, FRAME_SIZE);
@@ -986,6 +1054,8 @@ static int uac_capture_drain(struct pvt *pvt)
 
 		state = snd_pcm_state(pvt->icard);
 		if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
+			pvt->uac_diag_capture_prepare++;
+			ast_verb(3, "[%s] UAC diag capture prepare state=%d\n", PVT_ID(pvt), state);
 			r = snd_pcm_prepare(pvt->icard);
 			if (r < 0) {
 				ast_log(LOG_ERROR, "Unable to prepare capture PCM: %s\n", snd_strerror(r));
@@ -996,6 +1066,8 @@ static int uac_capture_drain(struct pvt *pvt)
 			state = snd_pcm_state(pvt->icard);
 		}
 		if (state == SND_PCM_STATE_PREPARED) {
+			pvt->uac_diag_capture_start++;
+			ast_verb(3, "[%s] UAC diag capture start\n", PVT_ID(pvt));
 			r = snd_pcm_start(pvt->icard);
 			if (r < 0 && r != -EBUSY) {
 				ast_log(LOG_ERROR, "Unable to start capture PCM: %s\n", snd_strerror(r));
@@ -1009,7 +1081,10 @@ static int uac_capture_drain(struct pvt *pvt)
 		if (avail == -EAGAIN || avail == 0)
 			break;
 		if (avail < 0) {
-			int rec = snd_pcm_recover(pvt->icard, (int)avail, 1);
+			int rec;
+			pvt->uac_diag_capture_avail_recover++;
+			ast_verb(3, "[%s] UAC diag capture avail recover avail=%ld\n", PVT_ID(pvt), (long)avail);
+			rec = snd_pcm_recover(pvt->icard, (int)avail, 1);
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 			pvt->uac_rx_fadein_left = 2;
@@ -1029,7 +1104,10 @@ static int uac_capture_drain(struct pvt *pvt)
 		if (r == -EAGAIN || r == 0)
 			break;
 		if (r < 0) {
-			int rec = snd_pcm_recover(pvt->icard, r, 1);
+			int rec;
+			pvt->uac_diag_capture_read_recover++;
+			ast_verb(3, "[%s] UAC diag capture read recover read=%d\n", PVT_ID(pvt), r);
+			rec = snd_pcm_recover(pvt->icard, r, 1);
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 			pvt->uac_rx_fadein_left = 2;
@@ -1068,7 +1146,10 @@ static int uac_playback_tick(struct pvt *pvt)
 
 	state = snd_pcm_state(pvt->ocard);
 	if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
-		int r = snd_pcm_prepare(pvt->ocard);
+		int r;
+		pvt->uac_diag_playback_prepare++;
+		ast_verb(3, "[%s] UAC diag playback prepare state=%d\n", PVT_ID(pvt), state);
+		r = snd_pcm_prepare(pvt->ocard);
 		if (r < 0) {
 			ast_log(LOG_ERROR, "Unable to prepare playback PCM: %s\n", snd_strerror(r));
 			uac_raise_target(pvt, "playback prepare");
@@ -1080,7 +1161,10 @@ static int uac_playback_tick(struct pvt *pvt)
 	if (avail == -EAGAIN)
 		return 0;
 	if (avail < 0) {
-		int rec = snd_pcm_recover(pvt->ocard, (int)avail, 1);
+		int rec;
+		pvt->uac_diag_playback_avail_recover++;
+		ast_verb(3, "[%s] UAC diag playback avail recover avail=%ld\n", PVT_ID(pvt), (long)avail);
+		rec = snd_pcm_recover(pvt->ocard, (int)avail, 1);
 		if (rec < 0)
 			ast_log(LOG_ERROR, "Playback avail recover failed: %s\n", snd_strerror(rec));
 		uac_raise_target(pvt, "playback recover");
@@ -1139,7 +1223,10 @@ static int uac_playback_tick(struct pvt *pvt)
 			if (r == -EAGAIN)
 				break;
 			if (r < 0) {
-				int rec = snd_pcm_recover(pvt->ocard, r, 1);
+				int rec;
+				pvt->uac_diag_playback_write_recover++;
+				ast_verb(3, "[%s] UAC diag playback write recover write=%d\n", PVT_ID(pvt), r);
+				rec = snd_pcm_recover(pvt->ocard, r, 1);
 				if (rec < 0)
 					ast_log(LOG_ERROR, "Write error: %s\n", snd_strerror(rec));
 				uac_raise_target(pvt, "playback write");
@@ -1184,6 +1271,9 @@ static struct ast_frame *uac_dequeue_frame(struct cpvt *cpvt, struct pvt *pvt, i
 		}
 		if (rb_used(&pvt->uac_rx_rb) > (size_t)(pvt->uac_target_frames + 2) * FRAME_SIZE) {
 			rb_read_upd(&pvt->uac_rx_rb, FRAME_SIZE);
+			pvt->uac_diag_rx_rb_drop++;
+			ast_verb(3, "[%s] UAC diag RX trim old frame target=%u used=%lu\n",
+				PVT_ID(pvt), pvt->uac_target_frames, (unsigned long)rb_used(&pvt->uac_rx_rb));
 			*degraded = 1;
 		}
 	} else if (pvt->uac_have_last_rx && pvt->uac_rx_plc_left > 0) {
@@ -1389,8 +1479,16 @@ e_return:
 		if (pvt->a_timer)
 			ast_timer_ack(pvt->a_timer, 1);
 
-		degraded |= uac_capture_drain(pvt);
-		degraded |= uac_playback_tick(pvt);
+		{
+			int capture_degraded = uac_capture_drain(pvt);
+			int playback_degraded = uac_playback_tick(pvt);
+			if (capture_degraded)
+				pvt->uac_diag_capture_degraded_ticks++;
+			if (playback_degraded)
+				pvt->uac_diag_playback_degraded_ticks++;
+			degraded |= capture_degraded;
+			degraded |= playback_degraded;
+		}
 		out = uac_dequeue_frame(cpvt, pvt, &degraded);
 
 		if (pvt->dsp)

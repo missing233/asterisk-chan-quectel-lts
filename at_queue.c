@@ -318,6 +318,34 @@ EXPORT_DEF int at_queue_insert(struct cpvt * cpvt, at_queue_cmd_t * cmds, unsign
 
 
 #/* */
+EXPORT_DEF unsigned at_queue_drop_pending_dtmf(struct pvt * pvt, struct cpvt * cpvt)
+{
+	struct at_queue_task *task;
+	unsigned dropped = 0;
+
+	AST_LIST_TRAVERSE_SAFE_BEGIN(&pvt->at_queue, task, entry) {
+		at_queue_cmd_t *cmd;
+		if (task->cpvt != cpvt)
+			continue;
+		if (task->cindex >= task->cmdsno)
+			continue;
+		cmd = &task->cmds[task->cindex];
+		if (cmd->cmd != CMD_AT_DTMF || cmd->length == 0)
+			continue;
+
+		AST_LIST_REMOVE_CURRENT(entry);
+		PVT_STATE(pvt, at_tasks)--;
+		PVT_STATE(pvt, at_cmds) -= task->cmdsno - task->cindex;
+		dropped++;
+		ast_verb(3, "[%s] DTMF diag drop pending queued DTMF for call idx %d\n",
+			PVT_ID(pvt), cpvt ? cpvt->call_idx : -1);
+		at_queue_free(task);
+	}
+	AST_LIST_TRAVERSE_SAFE_END;
+
+	return dropped;
+}
+
 EXPORT_DEF void at_queue_handle_result (struct pvt* pvt, at_res_t res)
 {
 	/* move queue */

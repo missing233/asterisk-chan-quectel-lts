@@ -339,8 +339,27 @@ static int at_response_ok (struct pvt* pvt, at_res_t res)
 				break;
 
 			case CMD_AT_DTMF:
+			{
+				int is_sys = (task->cpvt == &pvt->sys_chan || task->cpvt->channel == NULL);
+				int is_late = (task->cpvt->channel == NULL);
+				pvt->uac_diag_dtmf_send_ok++;
+				if (is_sys)
+					pvt->uac_diag_dtmf_send_ok_sys++;
+				if (is_late)
+					pvt->uac_diag_dtmf_send_ok_late++;
+				ast_verb(3, "[%s] DTMF diag send ok on %s cpvt call idx %d totals ok=%u ok_sys=%u ok_late=%u err=%u err_sys=%u err_late=%u\n",
+					PVT_ID(pvt),
+					is_sys ? "sys" : "call",
+					task->cpvt->call_idx,
+					pvt->uac_diag_dtmf_send_ok,
+					pvt->uac_diag_dtmf_send_ok_sys,
+					pvt->uac_diag_dtmf_send_ok_late,
+					pvt->uac_diag_dtmf_send_err,
+					pvt->uac_diag_dtmf_send_err_sys,
+					pvt->uac_diag_dtmf_send_err_late);
 				ast_debug (1, "[%s] DTMF sent successfully for call idx %d\n", PVT_ID(pvt), task->cpvt->call_idx);
 				break;
+			}
 
 			case CMD_AT_CUSD:
 				ast_verb (3, "[%s] Successfully sent USSD %p\n", PVT_ID(pvt), task);
@@ -644,8 +663,27 @@ static int at_response_error (struct pvt* pvt, at_res_t res)
 				break;
 
 			case CMD_AT_DTMF:
+			{
+				int is_sys = (task->cpvt == &pvt->sys_chan || task->cpvt->channel == NULL);
+				int is_late = (task->cpvt->channel == NULL);
+				pvt->uac_diag_dtmf_send_err++;
+				if (is_sys)
+					pvt->uac_diag_dtmf_send_err_sys++;
+				if (is_late)
+					pvt->uac_diag_dtmf_send_err_late++;
+				ast_verb(3, "[%s] DTMF diag send error on %s cpvt call idx %d totals ok=%u ok_sys=%u ok_late=%u err=%u err_sys=%u err_late=%u\n",
+					PVT_ID(pvt),
+					is_sys ? "sys" : "call",
+					task->cpvt->call_idx,
+					pvt->uac_diag_dtmf_send_ok,
+					pvt->uac_diag_dtmf_send_ok_sys,
+					pvt->uac_diag_dtmf_send_ok_late,
+					pvt->uac_diag_dtmf_send_err,
+					pvt->uac_diag_dtmf_send_err_sys,
+					pvt->uac_diag_dtmf_send_err_late);
 				log_cmd_response_error(pvt, ecmd, "[%s] Error sending DTMF\n", PVT_ID(pvt));
 				break;
+			}
 
 			case CMD_AT_COPS:
 				ast_debug (1, "[%s] Could not get provider name\n", PVT_ID(pvt));

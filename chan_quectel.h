@@ -169,6 +169,25 @@ typedef struct pvt
 	unsigned int	uac_rx_fadein_left:2;		/*!< fade-in frames after RX gap/recovery */
 	unsigned int	uac_target_frames:3;		/*!< adaptive target buffering depth, in 20ms frames */
 	unsigned int	uac_stable_ticks;		/*!< consecutive stable 20ms ticks */
+	unsigned int	uac_diag_dtmf_begin;		/*!< DTMF begin events in current UAC call */
+	unsigned int	uac_diag_dtmf_drop_pending;	/*!< pending queued DTMF dropped on hangup */
+	unsigned int	uac_diag_dtmf_send_ok;		/*!< modem acknowledged DTMF send */
+	unsigned int	uac_diag_dtmf_send_ok_sys;	/*!< DTMF send success happened on sys/non-call cpvt */
+	unsigned int	uac_diag_dtmf_send_ok_late;	/*!< DTMF send success completed after call channel was gone */
+	unsigned int	uac_diag_dtmf_send_err;		/*!< modem rejected/failed DTMF send */
+	unsigned int	uac_diag_dtmf_send_err_sys;	/*!< DTMF send error happened on sys/non-call cpvt */
+	unsigned int	uac_diag_dtmf_send_err_late;	/*!< DTMF send error completed after call channel was gone */
+	unsigned int	uac_diag_tx_rb_drop;		/*!< TX ringbuffer dropped an old frame */
+	unsigned int	uac_diag_rx_rb_drop;		/*!< RX ringbuffer dropped an old frame */
+	unsigned int	uac_diag_capture_prepare;	/*!< capture prepare attempts */
+	unsigned int	uac_diag_capture_start;		/*!< capture start attempts */
+	unsigned int	uac_diag_capture_avail_recover;	/*!< capture avail recover attempts */
+	unsigned int	uac_diag_capture_read_recover;	/*!< capture read recover attempts */
+	unsigned int	uac_diag_playback_prepare;	/*!< playback prepare attempts */
+	unsigned int	uac_diag_playback_avail_recover;	/*!< playback avail recover attempts */
+	unsigned int	uac_diag_playback_write_recover;	/*!< playback write recover attempts */
+	unsigned int	uac_diag_capture_degraded_ticks;	/*!< capture tick reported degraded */
+	unsigned int	uac_diag_playback_degraded_ticks;	/*!< playback tick reported degraded */
 	snd_pcm_uframes_t	uac_capture_period;		/*!< negotiated UAC capture period size */
 	snd_pcm_uframes_t	uac_capture_buffer;		/*!< negotiated UAC capture buffer size */
 	snd_pcm_uframes_t	uac_playback_period;		/*!< negotiated UAC playback period size */
