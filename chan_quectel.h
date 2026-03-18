@@ -188,7 +188,8 @@ typedef struct pvt
 	unsigned int	uac_diag_playback_write_recover;	/*!< playback write recover attempts */
 	unsigned int	uac_diag_capture_degraded_ticks;	/*!< capture tick reported degraded */
 	unsigned int	uac_diag_playback_degraded_ticks;	/*!< playback tick reported degraded */
-	unsigned int	uac_diag_playback_plc_ticks;	/*!< playback tick used PLC frame because TX queue was empty */
+	unsigned int	uac_diag_playback_plc_ticks;	/*!< playback tick used short PLC frame because TX queue was empty */
+	unsigned int	uac_diag_playback_hold_ticks;	/*!< playback tick used extended DTMF hold frame because TX queue was empty */
 	unsigned int	uac_diag_playback_silence_ticks;	/*!< playback tick injected silence because TX queue was empty */
 	unsigned int	uac_diag_playback_short_write_breaks;	/*!< playback loop stopped with unwritten samples left */
 	unsigned int	uac_diag_playback_degraded_logs;	/*!< playback degraded detail logs already emitted */
@@ -203,9 +204,11 @@ typedef struct pvt
 	unsigned int	uac_diag_tx_rb_empty_gap_60ms;	/*!< TX rb empty after TX start with last gap >60ms */
 	unsigned int	uac_diag_playback_degraded_after_tx;	/*!< degraded playback ticks after first TX frame was seen */
 	unsigned int	uac_diag_playback_plc_after_tx;	/*!< PLC playback ticks after first TX frame was seen */
+	unsigned int	uac_diag_playback_hold_after_tx;	/*!< extended DTMF hold playback ticks after first TX frame was seen */
 	unsigned int	uac_diag_playback_silence_after_tx;	/*!< silence playback ticks after first TX frame was seen */
 	unsigned int	uac_diag_playback_degraded_dtmf;	/*!< degraded playback ticks during DTMF window */
 	unsigned int	uac_diag_playback_plc_dtmf;	/*!< PLC playback ticks during DTMF window */
+	unsigned int	uac_diag_playback_hold_dtmf;	/*!< extended DTMF hold playback ticks during DTMF window */
 	unsigned int	uac_diag_playback_silence_dtmf;	/*!< silence playback ticks during DTMF window */
 	unsigned int	uac_diag_rx_frame_in;		/*!< RX voice frames queued from UAC capture */
 	unsigned int	uac_diag_rx_gap_25ms;		/*!< gap >25ms between queued RX voice frames */

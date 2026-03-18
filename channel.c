@@ -56,6 +56,9 @@ static void uac_diag_note_rx_delivery(struct pvt *pvt, int degraded, int kind, s
 #define UAC_DIAG_GAP_EVENT_MS 60U
 #define UAC_DIAG_GAP_WARN_MS 250U
 #define UAC_DIAG_DTMF_WINDOW_MS 1500U
+#define UAC_TX_DTMF_CONCEAL_MAX_MS 320U
+#define UAC_TX_DTMF_CONCEAL_ATTEN_NUM 7U
+#define UAC_TX_DTMF_CONCEAL_ATTEN_DEN 8U
 
 #define UAC_DIAG_RX_KIND_NORMAL  0
 #define UAC_DIAG_RX_KIND_PLC     1
@@ -521,7 +524,7 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 	UAC_DIAG_SUMMARY(pvt,
 		"summary tx tx_in=%u tx_gap_25ms=%u tx_gap_60ms=%u tx_gap_250ms=%u tx_gap_60ms_post_answer=%u "
 		"tx_gap_60ms_dtmf=%u tx_gap_max_ms=%u tx_rb_drop=%u tx_rb_empty_after_tx=%u tx_rb_empty_gap_60ms=%u "
-		"playback_degraded_after_tx=%u playback_plc_after_tx=%u playback_silence_after_tx=%u",
+		"playback_degraded_after_tx=%u playback_plc_after_tx=%u playback_hold_after_tx=%u playback_silence_after_tx=%u",
 		pvt->uac_diag_tx_frame_in,
 		pvt->uac_diag_tx_gap_25ms,
 		pvt->uac_diag_tx_gap_60ms,
@@ -534,6 +537,7 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 		pvt->uac_diag_tx_rb_empty_gap_60ms,
 		pvt->uac_diag_playback_degraded_after_tx,
 		pvt->uac_diag_playback_plc_after_tx,
+		pvt->uac_diag_playback_hold_after_tx,
 		pvt->uac_diag_playback_silence_after_tx);
 
 	UAC_DIAG_SUMMARY(pvt,
@@ -573,8 +577,8 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 	UAC_DIAG_SUMMARY(pvt,
 		"summary pcm capture_prepare=%u capture_start=%u capture_avail_recover=%u capture_read_recover=%u "
 		"capture_degraded=%u playback_prepare=%u playback_avail_recover=%u playback_write_recover=%u "
-		"playback_degraded=%u playback_plc=%u playback_silence=%u playback_short_write=%u "
-		"playback_degraded_dtmf=%u playback_plc_dtmf=%u playback_silence_dtmf=%u",
+		"playback_degraded=%u playback_plc=%u playback_hold=%u playback_silence=%u playback_short_write=%u "
+		"playback_degraded_dtmf=%u playback_plc_dtmf=%u playback_hold_dtmf=%u playback_silence_dtmf=%u",
 		pvt->uac_diag_capture_prepare,
 		pvt->uac_diag_capture_start,
 		pvt->uac_diag_capture_avail_recover,
@@ -585,10 +589,12 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 		pvt->uac_diag_playback_write_recover,
 		pvt->uac_diag_playback_degraded_ticks,
 		pvt->uac_diag_playback_plc_ticks,
+		pvt->uac_diag_playback_hold_ticks,
 		pvt->uac_diag_playback_silence_ticks,
 		pvt->uac_diag_playback_short_write_breaks,
 		pvt->uac_diag_playback_degraded_dtmf,
 		pvt->uac_diag_playback_plc_dtmf,
+		pvt->uac_diag_playback_hold_dtmf,
 		pvt->uac_diag_playback_silence_dtmf);
 
 	UAC_DIAG_SUMMARY(pvt,
@@ -1150,12 +1156,15 @@ static void uac_diag_playback_note(struct pvt *pvt, const char *reason,
 	pvt->uac_diag_playback_last_gap_ms = gap_ms;
 
 	seen = pvt->uac_diag_playback_plc_ticks +
+		pvt->uac_diag_playback_hold_ticks +
 		pvt->uac_diag_playback_silence_ticks +
 		pvt->uac_diag_playback_short_write_breaks;
 	if (uac_diag_in_dtmf_window(pvt)) {
 		pvt->uac_diag_playback_degraded_dtmf++;
 		if (reason && !strcmp(reason, "tx-plc"))
 			pvt->uac_diag_playback_plc_dtmf++;
+		else if (reason && !strcmp(reason, "tx-hold"))
+			pvt->uac_diag_playback_hold_dtmf++;
 		else if (reason && !strcmp(reason, "tx-silence"))
 			pvt->uac_diag_playback_silence_dtmf++;
 	}
@@ -1202,6 +1211,7 @@ static void uac_diag_reset(struct pvt *pvt)
 	pvt->uac_diag_capture_degraded_ticks = 0;
 	pvt->uac_diag_playback_degraded_ticks = 0;
 	pvt->uac_diag_playback_plc_ticks = 0;
+	pvt->uac_diag_playback_hold_ticks = 0;
 	pvt->uac_diag_playback_silence_ticks = 0;
 	pvt->uac_diag_playback_short_write_breaks = 0;
 	pvt->uac_diag_playback_degraded_logs = 0;
@@ -1216,9 +1226,11 @@ static void uac_diag_reset(struct pvt *pvt)
 	pvt->uac_diag_tx_rb_empty_gap_60ms = 0;
 	pvt->uac_diag_playback_degraded_after_tx = 0;
 	pvt->uac_diag_playback_plc_after_tx = 0;
+	pvt->uac_diag_playback_hold_after_tx = 0;
 	pvt->uac_diag_playback_silence_after_tx = 0;
 	pvt->uac_diag_playback_degraded_dtmf = 0;
 	pvt->uac_diag_playback_plc_dtmf = 0;
+	pvt->uac_diag_playback_hold_dtmf = 0;
 	pvt->uac_diag_playback_silence_dtmf = 0;
 	pvt->uac_diag_rx_frame_in = 0;
 	pvt->uac_diag_rx_gap_25ms = 0;
@@ -1303,6 +1315,18 @@ static void uac_fade_frame(char *frame, unsigned int plc_left)
 
 	for (i = 0; i < FRAME_SIZE2; ++i)
 		samples[i] = (short)((samples[i] * mul) / div);
+}
+
+static void uac_scale_frame(char *frame, unsigned int mul, unsigned int div)
+{
+	short *samples = (short *)frame;
+	unsigned int i;
+
+	if (div == 0)
+		return;
+
+	for (i = 0; i < FRAME_SIZE2; ++i)
+		samples[i] = (short)((samples[i] * (int)mul) / (int)div);
 }
 
 static unsigned int uac_abs_sample(int v)
@@ -1643,36 +1667,56 @@ static int uac_playback_tick(struct pvt *pvt)
 			memcpy(pvt->uac_last_tx_frame, frame, FRAME_SIZE);
 			pvt->uac_have_last_tx = 1;
 			pvt->uac_tx_plc_left = 2;
-		} else if (pvt->uac_have_last_tx && pvt->uac_tx_plc_left > 0) {
-			unsigned int gap_ms = uac_diag_ms_since_last_tx(pvt);
-			memcpy(frame, pvt->uac_last_tx_frame, FRAME_SIZE);
-			uac_fade_frame(frame, pvt->uac_tx_plc_left);
-			pvt->uac_tx_plc_left--;
-			pvt->uac_diag_playback_plc_ticks++;
-			if (pvt->uac_diag_tx_started) {
-				pvt->uac_diag_playback_degraded_after_tx++;
-				pvt->uac_diag_playback_plc_after_tx++;
-				pvt->uac_diag_tx_rb_empty_after_tx++;
-				if (gap_ms > 60U)
-					pvt->uac_diag_tx_rb_empty_gap_60ms++;
-			}
-			uac_diag_playback_note(pvt, "tx-plc", state, avail, queued, want_fill, 0);
-			uac_raise_target(pvt, "tx underrun");
-			degraded = 1;
 		} else {
 			unsigned int gap_ms = uac_diag_ms_since_last_tx(pvt);
-			memset(frame, 0, sizeof(frame));
-			pvt->uac_diag_playback_silence_ticks++;
-			if (pvt->uac_diag_tx_started) {
-				pvt->uac_diag_playback_degraded_after_tx++;
-				pvt->uac_diag_playback_silence_after_tx++;
-				pvt->uac_diag_tx_rb_empty_after_tx++;
-				if (gap_ms > 60U)
-					pvt->uac_diag_tx_rb_empty_gap_60ms++;
+			int dtmf_hold = pvt->uac_have_last_tx && uac_diag_is_post_answer(pvt) &&
+				uac_diag_in_dtmf_window(pvt) && gap_ms <= UAC_TX_DTMF_CONCEAL_MAX_MS;
+
+			if (dtmf_hold) {
+				memcpy(frame, pvt->uac_last_tx_frame, FRAME_SIZE);
+				uac_scale_frame(frame, UAC_TX_DTMF_CONCEAL_ATTEN_NUM, UAC_TX_DTMF_CONCEAL_ATTEN_DEN);
+				memcpy(pvt->uac_last_tx_frame, frame, FRAME_SIZE);
+				pvt->uac_diag_playback_hold_ticks++;
+				if (uac_diag_in_dtmf_window(pvt))
+					pvt->uac_diag_playback_hold_dtmf++;
+				if (pvt->uac_diag_tx_started) {
+					pvt->uac_diag_playback_degraded_after_tx++;
+					pvt->uac_diag_playback_hold_after_tx++;
+					pvt->uac_diag_tx_rb_empty_after_tx++;
+					if (gap_ms > 60U)
+						pvt->uac_diag_tx_rb_empty_gap_60ms++;
+				}
+				uac_diag_playback_note(pvt, "tx-hold", state, avail, queued, want_fill, 0);
+				degraded = 1;
+			} else if (pvt->uac_have_last_tx && pvt->uac_tx_plc_left > 0) {
+				memcpy(frame, pvt->uac_last_tx_frame, FRAME_SIZE);
+				uac_fade_frame(frame, pvt->uac_tx_plc_left);
+				pvt->uac_tx_plc_left--;
+				pvt->uac_diag_playback_plc_ticks++;
+				if (pvt->uac_diag_tx_started) {
+					pvt->uac_diag_playback_degraded_after_tx++;
+					pvt->uac_diag_playback_plc_after_tx++;
+					pvt->uac_diag_tx_rb_empty_after_tx++;
+					if (gap_ms > 60U)
+						pvt->uac_diag_tx_rb_empty_gap_60ms++;
+				}
+				uac_diag_playback_note(pvt, "tx-plc", state, avail, queued, want_fill, 0);
+				uac_raise_target(pvt, "tx underrun");
+				degraded = 1;
+			} else {
+				memset(frame, 0, sizeof(frame));
+				pvt->uac_diag_playback_silence_ticks++;
+				if (pvt->uac_diag_tx_started) {
+					pvt->uac_diag_playback_degraded_after_tx++;
+					pvt->uac_diag_playback_silence_after_tx++;
+					pvt->uac_diag_tx_rb_empty_after_tx++;
+					if (gap_ms > 60U)
+						pvt->uac_diag_tx_rb_empty_gap_60ms++;
+				}
+				uac_diag_playback_note(pvt, "tx-silence", state, avail, queued, want_fill, 0);
+				uac_raise_target(pvt, "tx silence");
+				degraded = 1;
 			}
-			uac_diag_playback_note(pvt, "tx-silence", state, avail, queued, want_fill, 0);
-			uac_raise_target(pvt, "tx silence");
-			degraded = 1;
 		}
 
 		ptr = frame;
