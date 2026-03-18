@@ -342,15 +342,18 @@ static int channel_call(struct ast_channel* channel, char* dest, attribute_unuse
 	return 0;
 }
 
-#/* ARCH: move to cpvt level */
+/* ARCH: move to cpvt level */
 static void disactivate_call(struct cpvt* cpvt)
 {
 	struct pvt* pvt;
+	unsigned int uac_diag_summary_logged = 0;
 	pvt = cpvt->pvt;
 
 	if(cpvt->channel && CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED))
 	{
 		if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) {
+			uac_diag_log_summary_once(pvt, cpvt, "released");
+			uac_diag_summary_logged = pvt->uac_diag_summary_logged;
 			if (pvt->icard)
 				snd_pcm_drop(pvt->icard);
 			if (pvt->ocard) {
@@ -358,6 +361,7 @@ static void disactivate_call(struct cpvt* cpvt)
 				snd_pcm_prepare(pvt->ocard);
 			}
 			uac_reset_runtime(pvt);
+			pvt->uac_diag_summary_logged = uac_diag_summary_logged;
 		} else mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
 		ast_channel_set_fd (cpvt->channel, 1, -1);
 		ast_channel_set_fd (cpvt->channel, 0, -1);
