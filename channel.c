@@ -48,6 +48,8 @@ static void uac_diag_mark_answered(struct pvt *pvt, struct cpvt *cpvt, const cha
 static void uac_diag_note_rx_enqueue(struct pvt *pvt);
 static void uac_diag_log_summary_once(struct pvt *pvt, struct cpvt *cpvt, const char *reason);
 static void uac_diag_note_rx_delivery(struct pvt *pvt, int degraded, int kind, struct ast_frame *out);
+static int uac_runtime_fault(struct pvt *pvt, unsigned int *counter, const char *reason, int reopen_now);
+static void uac_runtime_ok(unsigned int *counter);
 
 #define UAC_DIAG_SUMMARY_LEVEL 2
 #define UAC_DIAG_EVENT_LEVEL 3
@@ -59,6 +61,7 @@ static void uac_diag_note_rx_delivery(struct pvt *pvt, int degraded, int kind, s
 #define UAC_TX_DTMF_CONCEAL_MAX_MS 320U
 #define UAC_TX_DTMF_CONCEAL_ATTEN_NUM 7U
 #define UAC_TX_DTMF_CONCEAL_ATTEN_DEN 8U
+#define UAC_RUNTIME_FAULT_REOPEN_THRESHOLD 3U
 
 #define UAC_DIAG_RX_KIND_NORMAL  0
 #define UAC_DIAG_RX_KIND_PLC     1
@@ -581,6 +584,7 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 	UAC_DIAG_SUMMARY(pvt,
 		"summary pcm capture_prepare=%u capture_start=%u capture_avail_recover=%u capture_read_recover=%u "
 		"capture_degraded=%u playback_prepare=%u playback_avail_recover=%u playback_write_recover=%u "
+		"runtime_reopen=%u capture_bad_ticks=%u playback_bad_ticks=%u "
 		"playback_degraded=%u playback_plc=%u playback_hold=%u playback_silence=%u playback_short_write=%u "
 		"playback_degraded_dtmf=%u playback_plc_dtmf=%u playback_hold_dtmf=%u playback_silence_dtmf=%u",
 		pvt->uac_diag_capture_prepare,
@@ -591,6 +595,9 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 		pvt->uac_diag_playback_prepare,
 		pvt->uac_diag_playback_avail_recover,
 		pvt->uac_diag_playback_write_recover,
+		pvt->uac_diag_runtime_reopen,
+		pvt->uac_capture_bad_ticks,
+		pvt->uac_playback_bad_ticks,
 		pvt->uac_diag_playback_degraded_ticks,
 		pvt->uac_diag_playback_plc_ticks,
 		pvt->uac_diag_playback_hold_ticks,
@@ -1212,6 +1219,9 @@ static void uac_diag_reset(struct pvt *pvt)
 	pvt->uac_diag_playback_prepare = 0;
 	pvt->uac_diag_playback_avail_recover = 0;
 	pvt->uac_diag_playback_write_recover = 0;
+	pvt->uac_diag_runtime_reopen = 0;
+	pvt->uac_capture_bad_ticks = 0;
+	pvt->uac_playback_bad_ticks = 0;
 	pvt->uac_diag_capture_degraded_ticks = 0;
 	pvt->uac_diag_playback_degraded_ticks = 0;
 	pvt->uac_diag_playback_plc_ticks = 0;
@@ -1426,6 +1436,35 @@ static void uac_trim_queue(struct ringbuffer *rb, size_t keep_bytes)
 		rb_read_upd(rb, FRAME_SIZE);
 }
 
+static void uac_runtime_ok(unsigned int *counter)
+{
+	*counter = 0;
+}
+
+static int uac_runtime_fault(struct pvt *pvt, unsigned int *counter, const char *reason, int reopen_now)
+{
+	if (*counter != ~0U)
+		(*counter)++;
+
+	UAC_DIAG_EVENT(pvt, "runtime fault reason=%s streak=%u reopen=%u",
+		reason ? reason : "unknown", *counter, reopen_now ? 1U : 0U);
+	uac_raise_target(pvt, reason ? reason : "runtime fault");
+
+	if (reopen_now || *counter >= UAC_RUNTIME_FAULT_REOPEN_THRESHOLD) {
+		pvt->uac_diag_runtime_reopen++;
+		UAC_DIAG_EVENT(pvt, "runtime reopen reason=%s count=%u",
+			reason ? reason : "unknown", pvt->uac_diag_runtime_reopen);
+		if (soundcard_reopen(pvt) < 0)
+			ast_log(LOG_ERROR, "[%s] UAC runtime reopen failed after %s\n",
+				PVT_ID(pvt), reason ? reason : "runtime fault");
+		pvt->uac_capture_bad_ticks = 0;
+		pvt->uac_playback_bad_ticks = 0;
+		pvt->uac_rx_fadein_left = 2;
+	}
+
+	return 1;
+}
+
 static void uac_reset_runtime(struct pvt *pvt)
 {
 	pvt->uac_readpos = 0;
@@ -1498,6 +1537,7 @@ static int uac_capture_drain(struct pvt *pvt)
 	int loops = 0;
 	int degraded = 0;
 	int max_loops = 8;
+	int captured = 0;
 
 	if (pvt->uac_capture_buffer > FRAME_SIZE2) {
 		unsigned int buffer_frames = (unsigned int)(pvt->uac_capture_buffer / FRAME_SIZE2);
@@ -1513,16 +1553,22 @@ static int uac_capture_drain(struct pvt *pvt)
 		snd_pcm_uframes_t want;
 		int r;
 
+		if (!pvt->icard)
+			return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture missing", 1);
+
 		state = snd_pcm_state(pvt->icard);
 		if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
+			if (state == SND_PCM_STATE_DISCONNECTED || state == SND_PCM_STATE_SUSPENDED) {
+				UAC_DIAG_EVENT(pvt, "capture fatal state=%d", state);
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture state", 1);
+			}
 			pvt->uac_diag_capture_prepare++;
 			UAC_DIAG_EVENT(pvt, "capture prepare state=%d", state);
 			r = snd_pcm_prepare(pvt->icard);
 			if (r < 0) {
 				ast_log(LOG_ERROR, "Unable to prepare capture PCM: %s\n", snd_strerror(r));
 				pvt->uac_rx_fadein_left = 2;
-				uac_raise_target(pvt, "capture prepare");
-				return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture prepare", 1);
 			}
 			state = snd_pcm_state(pvt->icard);
 		}
@@ -1533,8 +1579,7 @@ static int uac_capture_drain(struct pvt *pvt)
 			if (r < 0 && r != -EBUSY) {
 				ast_log(LOG_ERROR, "Unable to start capture PCM: %s\n", snd_strerror(r));
 				pvt->uac_rx_fadein_left = 2;
-				uac_raise_target(pvt, "capture start");
-				return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture start", 1);
 			}
 		}
 
@@ -1549,10 +1594,11 @@ static int uac_capture_drain(struct pvt *pvt)
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 			pvt->uac_rx_fadein_left = 2;
-			if (rec < 0)
+			if (rec < 0) {
 				ast_log(LOG_ERROR, "Capture avail recover failed: %s\n", snd_strerror(rec));
-			uac_raise_target(pvt, "capture recover");
-			return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture recover", 1);
+			}
+			return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture recover", 0);
 		}
 
 		want = pvt->uac_readleft;
@@ -1572,11 +1618,12 @@ static int uac_capture_drain(struct pvt *pvt)
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 			pvt->uac_rx_fadein_left = 2;
-			if (rec < 0)
+			if (rec < 0) {
 				ast_log(LOG_ERROR, "Read recover failed: read=%s recover=%s\n",
 					snd_strerror(r), snd_strerror(rec));
-			uac_raise_target(pvt, "capture read");
-			return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture read", 1);
+			}
+			return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture read", 0);
 		}
 
 		pvt->uac_readpos += r;
@@ -1587,7 +1634,11 @@ static int uac_capture_drain(struct pvt *pvt)
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 		}
+		captured = 1;
 	}
+
+	if (captured)
+		uac_runtime_ok(&pvt->uac_capture_bad_ticks);
 
 	return degraded;
 }
@@ -1598,6 +1649,7 @@ static int uac_playback_tick(struct pvt *pvt)
 {
 	char frame[FRAME_SIZE];
 	int degraded = 0;
+	int wrote = 0;
 	snd_pcm_state_t state;
 	snd_pcm_sframes_t avail;
 	snd_pcm_uframes_t queued = 0;
@@ -1605,16 +1657,22 @@ static int uac_playback_tick(struct pvt *pvt)
 	unsigned int loops = 0;
 	unsigned int max_loops;
 
+	if (!pvt->ocard)
+		return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback missing", 1);
+
 	state = snd_pcm_state(pvt->ocard);
 	if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
 		int r;
+		if (state == SND_PCM_STATE_DISCONNECTED || state == SND_PCM_STATE_SUSPENDED) {
+			UAC_DIAG_EVENT(pvt, "playback fatal state=%d", state);
+			return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback state", 1);
+		}
 		pvt->uac_diag_playback_prepare++;
 		UAC_DIAG_EVENT(pvt, "playback prepare state=%d", state);
 		r = snd_pcm_prepare(pvt->ocard);
 		if (r < 0) {
 			ast_log(LOG_ERROR, "Unable to prepare playback PCM: %s\n", snd_strerror(r));
-			uac_raise_target(pvt, "playback prepare");
-			return 1;
+			return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback prepare", 1);
 		}
 	}
 
@@ -1626,15 +1684,35 @@ static int uac_playback_tick(struct pvt *pvt)
 		pvt->uac_diag_playback_avail_recover++;
 		UAC_DIAG_EVENT(pvt, "playback avail recover avail=%ld", (long)avail);
 		rec = snd_pcm_recover(pvt->ocard, (int)avail, 1);
-		if (rec < 0)
+		if (rec < 0) {
 			ast_log(LOG_ERROR, "Playback avail recover failed: %s\n", snd_strerror(rec));
-		uac_raise_target(pvt, "playback recover");
-		return 1;
+			return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback recover", 1);
+		}
+		return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback recover", 0);
 	}
 
 	if (pvt->uac_playback_buffer && (snd_pcm_uframes_t)avail <= pvt->uac_playback_buffer)
 		queued = pvt->uac_playback_buffer - (snd_pcm_uframes_t)avail;
 	want_fill = uac_pcm_target_fill(pvt);
+	if (state != SND_PCM_STATE_RUNNING) {
+		snd_pcm_uframes_t bootstrap_fill = want_fill;
+		snd_pcm_uframes_t floor = pvt->uac_playback_period ? (pvt->uac_playback_period * 2) : want_fill;
+
+		if (bootstrap_fill < floor)
+			bootstrap_fill = floor;
+		if (rb_used(&pvt->uac_tx_rb) < FRAME_SIZE && pvt->uac_playback_period &&
+		    bootstrap_fill < pvt->uac_playback_period * 3)
+			bootstrap_fill = pvt->uac_playback_period * 3;
+		if (pvt->uac_playback_buffer > pvt->uac_playback_period) {
+			snd_pcm_uframes_t cap = pvt->uac_playback_buffer - pvt->uac_playback_period;
+			if (cap > pvt->uac_playback_period * 3)
+				cap = pvt->uac_playback_period * 3;
+			if (bootstrap_fill > cap)
+				bootstrap_fill = cap;
+		}
+		if (bootstrap_fill > want_fill)
+			want_fill = bootstrap_fill;
+	}
 	pvt->uac_diag_playback_last_state = (unsigned int)state;
 	pvt->uac_diag_playback_last_avail = avail;
 	pvt->uac_diag_playback_last_queued = queued;
@@ -1734,10 +1812,11 @@ static int uac_playback_tick(struct pvt *pvt)
 				pvt->uac_diag_playback_write_recover++;
 				UAC_DIAG_EVENT(pvt, "playback write recover write=%d", r);
 				rec = snd_pcm_recover(pvt->ocard, r, 1);
-				if (rec < 0)
+				if (rec < 0) {
 					ast_log(LOG_ERROR, "Write error: %s\n", snd_strerror(rec));
-				uac_raise_target(pvt, "playback write");
-				return 1;
+					return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback write", 1);
+				}
+				return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback write", 0);
 			}
 			if (r == 0) {
 				pvt->uac_diag_playback_short_write_breaks++;
@@ -1746,6 +1825,7 @@ static int uac_playback_tick(struct pvt *pvt)
 			}
 			left -= (snd_pcm_uframes_t)r;
 			ptr += r * 2;
+			wrote = 1;
 		}
 		if (left > 0) {
 			pvt->uac_diag_playback_short_write_breaks++;
@@ -1754,6 +1834,9 @@ static int uac_playback_tick(struct pvt *pvt)
 		}
 		queued += FRAME_SIZE2;
 	}
+
+	if (wrote)
+		uac_runtime_ok(&pvt->uac_playback_bad_ticks);
 
 	return degraded;
 }
