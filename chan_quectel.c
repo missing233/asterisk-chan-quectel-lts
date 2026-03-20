@@ -287,6 +287,8 @@ static int soundcard_init(struct pvt * pvt)
 	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
 	pvt->uac_stable_ticks = 0;
+	pvt->uac_decay_hold_ticks = 0;
+	pvt->uac_target_ceiling_boost = 0;
 	snd_pcm_prepare(pvt->icard);
 	snd_pcm_prepare(pvt->ocard);
 
@@ -314,6 +316,8 @@ int soundcard_reopen(struct pvt *pvt)
 	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
 	pvt->uac_stable_ticks = 0;
+	pvt->uac_decay_hold_ticks = 0;
+	pvt->uac_target_ceiling_boost = 0;
 
 	ast_verb(2, "[%s] Reopening UAC sound card\n", PVT_ID(pvt));
 

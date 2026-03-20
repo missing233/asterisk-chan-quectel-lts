@@ -64,6 +64,10 @@ static void uac_runtime_ok(unsigned int *counter);
 #define UAC_RUNTIME_FAULT_REOPEN_THRESHOLD 3U
 #define UAC_STABLE_TICKS_DECAY_FAST 25U
 #define UAC_STABLE_TICKS_DECAY_SLOW 50U
+#define UAC_STABLE_HOLD_TICKS_MILD 8U
+#define UAC_STABLE_HOLD_TICKS_SEVERE 18U
+#define UAC_TARGET_BOOST_GAP_MS 120U
+#define UAC_TARGET_BOOST_SEVERE_GAP_MS 220U
 
 #define UAC_DIAG_RX_KIND_NORMAL  0
 #define UAC_DIAG_RX_KIND_PLC     1
@@ -929,7 +933,7 @@ static unsigned int uac_queue_capacity_frames(const struct pvt *pvt)
 	return (tx < rx) ? tx : rx;
 }
 
-static unsigned int uac_target_ceiling(const struct pvt *pvt)
+static unsigned int uac_target_base_ceiling(const struct pvt *pvt)
 {
 	unsigned int limit = uac_queue_capacity_frames(pvt);
 	unsigned int pcm_limit;
@@ -957,6 +961,59 @@ static unsigned int uac_target_ceiling(const struct pvt *pvt)
 
 	if (limit < 3)
 		limit = 3;
+
+	return limit;
+}
+
+static unsigned int uac_target_boost_ceiling(const struct pvt *pvt)
+{
+	unsigned int limit = uac_queue_capacity_frames(pvt);
+	unsigned int pcm_limit;
+
+	if (limit > 1)
+		limit -= 1;
+
+	if (pvt->uac_playback_buffer > FRAME_SIZE2) {
+		pcm_limit = (unsigned int)(pvt->uac_playback_buffer / FRAME_SIZE2);
+		if (pcm_limit > 2) {
+			pcm_limit -= 2;
+			if (pcm_limit < limit)
+				limit = pcm_limit;
+		}
+	}
+
+	if (limit < 4)
+		limit = 4;
+
+	return limit;
+}
+
+static unsigned int uac_tx_queue_keep_frames(const struct pvt *pvt)
+{
+	unsigned int keep = uac_target_base_ceiling(pvt) + 1U;
+	unsigned int cap = uac_queue_capacity_frames(pvt);
+
+	if (keep > cap)
+		keep = cap;
+	if (keep < 2U)
+		keep = 2U;
+
+	return keep;
+}
+
+static unsigned int uac_target_ceiling(const struct pvt *pvt)
+{
+	unsigned int limit = uac_target_base_ceiling(pvt);
+
+	if (pvt->uac_target_ceiling_boost) {
+		unsigned int boosted = limit + pvt->uac_target_ceiling_boost;
+		unsigned int boosted_limit = uac_target_boost_ceiling(pvt);
+
+		if (boosted > boosted_limit)
+			boosted = boosted_limit;
+		if (boosted > limit)
+			limit = boosted;
+	}
 
 	return limit;
 }
@@ -1309,12 +1366,63 @@ static void uac_raise_target(struct pvt *pvt, const char *reason)
 			PVT_ID(pvt), pvt->uac_target_frames, reason ? reason : "event");
 }
 
+static void uac_note_tx_stress(struct pvt *pvt, unsigned int gap_ms, int severe,
+		int allow_boost, const char *reason)
+{
+	unsigned int hold_ticks = UAC_STABLE_HOLD_TICKS_MILD;
+	unsigned int boost = 0;
+
+	if (gap_ms >= UAC_TARGET_BOOST_SEVERE_GAP_MS || severe)
+		hold_ticks = UAC_STABLE_HOLD_TICKS_SEVERE;
+	else if (gap_ms >= UAC_TARGET_BOOST_GAP_MS)
+		hold_ticks = UAC_STABLE_HOLD_TICKS_MILD + 4U;
+
+	if (allow_boost && (gap_ms >= UAC_TARGET_BOOST_GAP_MS || severe))
+		boost = 1;
+
+	if (hold_ticks > pvt->uac_decay_hold_ticks)
+		pvt->uac_decay_hold_ticks = hold_ticks;
+
+	if (allow_boost && uac_diag_is_post_answer(pvt) && boost > pvt->uac_target_ceiling_boost) {
+		pvt->uac_target_ceiling_boost = boost;
+		ast_debug(3, "[%s] UAC adaptive ceiling -> +%u frame(s) (%s gap=%u)\n",
+			PVT_ID(pvt), pvt->uac_target_ceiling_boost, reason ? reason : "stress", gap_ms);
+	}
+
+	pvt->uac_stable_ticks = 0;
+}
+
+static void uac_note_tx_backpressure(struct pvt *pvt)
+{
+	unsigned int base = uac_target_base_ceiling(pvt);
+
+	if (pvt->uac_target_frames > base) {
+		pvt->uac_target_frames = base;
+		ast_debug(3, "[%s] UAC adaptive target -> %u frame(s) (tx backpressure)\n",
+			PVT_ID(pvt), pvt->uac_target_frames);
+	}
+
+	if (pvt->uac_target_ceiling_boost)
+		pvt->uac_target_ceiling_boost = 0;
+
+	pvt->uac_decay_hold_ticks = 0;
+	pvt->uac_stable_ticks = 0;
+}
+
 static void uac_note_stable_tick(struct pvt *pvt)
 {
 	unsigned int decay_ticks;
 
-	if (pvt->uac_target_frames <= 1)
+	if (pvt->uac_target_frames <= 1) {
+		pvt->uac_target_ceiling_boost = 0;
+		pvt->uac_decay_hold_ticks = 0;
 		return;
+	}
+
+	if (pvt->uac_decay_hold_ticks > 0) {
+		pvt->uac_decay_hold_ticks--;
+		return;
+	}
 
 	decay_ticks = (pvt->uac_target_frames >= 3) ?
 		UAC_STABLE_TICKS_DECAY_FAST : UAC_STABLE_TICKS_DECAY_SLOW;
@@ -1322,6 +1430,8 @@ static void uac_note_stable_tick(struct pvt *pvt)
 	if (++pvt->uac_stable_ticks >= decay_ticks) {
 		pvt->uac_target_frames--;
 		pvt->uac_stable_ticks = 0;
+		if (pvt->uac_target_frames <= uac_target_base_ceiling(pvt))
+			pvt->uac_target_ceiling_boost = 0;
 		ast_debug(3, "[%s] UAC adaptive target -> %u frame(s) (stable %u ticks)\n",
 			PVT_ID(pvt), pvt->uac_target_frames, decay_ticks);
 	}
@@ -1502,6 +1612,8 @@ static void uac_reset_runtime(struct pvt *pvt)
 	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
 	pvt->uac_stable_ticks = 0;
+	pvt->uac_decay_hold_ticks = 0;
+	pvt->uac_target_ceiling_boost = 0;
 	uac_diag_reset(pvt);
 }
 
@@ -1509,21 +1621,24 @@ static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
 {
 	char frame[FRAME_SIZE];
 	size_t copy = len > FRAME_SIZE ? FRAME_SIZE : len;
-	size_t keep = (size_t)(pvt->uac_target_frames + 2) * FRAME_SIZE;
+	size_t keep = (size_t)uac_tx_queue_keep_frames(pvt) * FRAME_SIZE;
 	unsigned int gap_ms = pvt->uac_diag_tx_started ? uac_diag_ms_since_last_tx(pvt) : 0U;
 	unsigned int queued_frames = (unsigned int)(rb_used(&pvt->uac_tx_rb) / FRAME_SIZE);
 
 	memset(frame, 0, sizeof(frame));
 	memcpy(frame, data, copy);
 	uac_diag_note_tx_enqueue(pvt);
-	if (gap_ms > UAC_DIAG_GAP_EVENT_MS && queued_frames <= pvt->uac_target_frames)
+	if (gap_ms > UAC_DIAG_GAP_EVENT_MS && queued_frames <= pvt->uac_target_frames) {
+		uac_note_tx_stress(pvt, gap_ms, 0, 0, gap_ms > UAC_DIAG_GAP_WARN_MS ? "tx gap" : "tx jitter");
 		uac_raise_target(pvt, gap_ms > UAC_DIAG_GAP_WARN_MS ? "tx gap" : "tx jitter");
+	}
 
 	if (pvt->uac_have_last_tx)
 		uac_sanitize_edge_from_prev(pvt->uac_last_tx_frame, frame, pvt->uac_tx_plc_left != 0);
 
 	while (rb_free(&pvt->uac_tx_rb) < FRAME_SIZE) {
 		rb_read_upd(&pvt->uac_tx_rb, FRAME_SIZE);
+		uac_note_tx_backpressure(pvt);
 		pvt->uac_diag_tx_rb_drop++;
 		ast_verb(3, "[%s] UAC diag TX rb drop old frame target=%u used=%lu\n",
 			PVT_ID(pvt), pvt->uac_target_frames, (unsigned long)rb_used(&pvt->uac_tx_rb));
@@ -1810,6 +1925,7 @@ static int uac_playback_tick(struct pvt *pvt)
 						pvt->uac_diag_tx_rb_empty_gap_60ms++;
 				}
 				uac_diag_playback_note(pvt, "tx-plc", state, avail, queued, want_fill, 0);
+				uac_note_tx_stress(pvt, gap_ms, gap_ms >= UAC_TARGET_BOOST_GAP_MS, 1, "tx underrun");
 				uac_raise_target(pvt, "tx underrun");
 				degraded = 1;
 			} else {
@@ -1823,6 +1939,7 @@ static int uac_playback_tick(struct pvt *pvt)
 						pvt->uac_diag_tx_rb_empty_gap_60ms++;
 				}
 				uac_diag_playback_note(pvt, "tx-silence", state, avail, queued, want_fill, 0);
+				uac_note_tx_stress(pvt, gap_ms, gap_ms >= UAC_TARGET_BOOST_GAP_MS, 1, "tx silence");
 				uac_raise_target(pvt, "tx silence");
 				degraded = 1;
 			}

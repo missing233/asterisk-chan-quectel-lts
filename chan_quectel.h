@@ -169,6 +169,8 @@ typedef struct pvt
 	unsigned int	uac_rx_fadein_left:2;		/*!< fade-in frames after RX gap/recovery */
 	unsigned int	uac_target_frames:3;		/*!< adaptive target buffering depth, in 20ms frames */
 	unsigned int	uac_stable_ticks;		/*!< consecutive stable 20ms ticks */
+	unsigned int	uac_decay_hold_ticks;		/*!< short post-distress decay hold window, in 20ms ticks */
+	unsigned int	uac_target_ceiling_boost:2;	/*!< temporary TX-stress ceiling boost above base target ceiling */
 	unsigned int	uac_diag_dtmf_begin;		/*!< DTMF begin events in current UAC call */
 	unsigned int	uac_diag_dtmf_drop_pending;	/*!< pending queued DTMF dropped on hangup */
 	unsigned int	uac_diag_dtmf_send_ok;		/*!< modem acknowledged DTMF send */
