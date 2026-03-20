@@ -186,6 +186,9 @@ typedef struct pvt
 	unsigned int	uac_diag_playback_prepare;	/*!< playback prepare attempts */
 	unsigned int	uac_diag_playback_avail_recover;	/*!< playback avail recover attempts */
 	unsigned int	uac_diag_playback_write_recover;	/*!< playback write recover attempts */
+	unsigned int	uac_diag_runtime_reopen;	/*!< runtime-triggered UAC sound card reopen attempts */
+	unsigned int	uac_capture_bad_ticks;	/*!< consecutive capture-side ALSA faults/recoveries */
+	unsigned int	uac_playback_bad_ticks;	/*!< consecutive playback-side ALSA faults/recoveries */
 	unsigned int	uac_diag_capture_degraded_ticks;	/*!< capture tick reported degraded */
 	unsigned int	uac_diag_playback_degraded_ticks;	/*!< playback tick reported degraded */
 	unsigned int	uac_diag_playback_plc_ticks;	/*!< playback tick used short PLC frame because TX queue was empty */
