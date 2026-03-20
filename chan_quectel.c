@@ -84,6 +84,31 @@ EXPORT_DEF struct ast_format chan_quectel_format;
 EXPORT_DEF struct ast_format_cap * chan_quectel_format_cap;
 #endif /* ^10-13 */
 
+static void soundcard_close(struct pvt *pvt)
+{
+	if (!pvt)
+		return;
+
+	if (pvt->icard) {
+		snd_pcm_drop(pvt->icard);
+		snd_pcm_close(pvt->icard);
+		pvt->icard = NULL;
+	}
+
+	if (pvt->ocard) {
+		snd_pcm_drop(pvt->ocard);
+		snd_pcm_close(pvt->ocard);
+		pvt->ocard = NULL;
+	}
+
+	pvt->audio_fd = -1;
+	writedev = -1;
+	pvt->uac_capture_period = 0;
+	pvt->uac_capture_buffer = 0;
+	pvt->uac_playback_period = 0;
+	pvt->uac_playback_buffer = 0;
+}
+
 static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,struct pvt * pvt)
 {
 	int err;
@@ -166,9 +191,13 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,struct pvt *
 	memset(swparams, 0, snd_pcm_sw_params_sizeof());
 	snd_pcm_sw_params_current(handle, swparams);
 
-	if (stream == SND_PCM_STREAM_PLAYBACK)
-		start_threshold = period_size;
-	else
+	if (stream == SND_PCM_STREAM_PLAYBACK) {
+		start_threshold = period_size ? period_size : (DESIRED_RATE / 50);
+		if (buffer_size > period_size && start_threshold > buffer_size - period_size)
+			start_threshold = buffer_size - period_size;
+		if (start_threshold < period_size)
+			start_threshold = period_size;
+	} else
 		start_threshold = 1;
 
 	err = snd_pcm_sw_params_set_start_threshold(handle, swparams, start_threshold);
@@ -223,16 +252,23 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,struct pvt *
 
 static int soundcard_init(struct pvt * pvt)
 {
+	writedev = -1;
+	pvt->audio_fd = -1;
+	pvt->uac_capture_period = 0;
+	pvt->uac_capture_buffer = 0;
+	pvt->uac_playback_period = 0;
+	pvt->uac_playback_buffer = 0;
 
-       pvt->icard = alsa_card_init(CONF_UNIQ(pvt, alsadev), SND_PCM_STREAM_CAPTURE,pvt);
+	pvt->icard = alsa_card_init(CONF_UNIQ(pvt, alsadev), SND_PCM_STREAM_CAPTURE,pvt);
 	if (!pvt->icard) {
-			ast_log(LOG_ERROR, "Problem opening ALSA capture device %s \n",CONF_UNIQ(pvt, alsadev));
-			return -1;
-        }
+		ast_log(LOG_ERROR, "Problem opening ALSA capture device %s \n",CONF_UNIQ(pvt, alsadev));
+		return -1;
+	}
 	pvt->ocard = alsa_card_init(CONF_UNIQ(pvt, alsadev), SND_PCM_STREAM_PLAYBACK,pvt);
 
 	if (!pvt->ocard) {
 		ast_log(LOG_ERROR, "Problem opening ALSA playback device %s \n",CONF_UNIQ(pvt, alsadev));
+		soundcard_close(pvt);
 		return -1;
 	}
 	ast_verb (2, "Sound Card %s Initialized\n", CONF_UNIQ(pvt, alsadev));
@@ -250,7 +286,11 @@ static int soundcard_init(struct pvt * pvt)
 	pvt->uac_rx_plc_left = 0;
 	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
+	pvt->uac_floor_frames = 1;
 	pvt->uac_stable_ticks = 0;
+	pvt->uac_floor_stable_ticks = 0;
+	pvt->uac_decay_hold_ticks = 0;
+	pvt->uac_target_ceiling_boost = 0;
 	snd_pcm_prepare(pvt->icard);
 	snd_pcm_prepare(pvt->ocard);
 
@@ -261,19 +301,8 @@ int soundcard_reopen(struct pvt *pvt)
 	if (!pvt)
 		return -1;
 
-	if (pvt->icard) {
-		snd_pcm_drop(pvt->icard);
-		snd_pcm_close(pvt->icard);
-		pvt->icard = NULL;
-	}
+	soundcard_close(pvt);
 
-	if (pvt->ocard) {
-		snd_pcm_drop(pvt->ocard);
-		snd_pcm_close(pvt->ocard);
-		pvt->ocard = NULL;
-	}
-
-	pvt->audio_fd = -1;
 	pvt->uac_readpos = 0;
 	pvt->uac_readleft = FRAME_SIZE2;
 	pvt->uac_write_len = 0;
@@ -288,7 +317,11 @@ int soundcard_reopen(struct pvt *pvt)
 	pvt->uac_rx_plc_left = 0;
 	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
+	pvt->uac_floor_frames = 1;
 	pvt->uac_stable_ticks = 0;
+	pvt->uac_floor_stable_ticks = 0;
+	pvt->uac_decay_hold_ticks = 0;
+	pvt->uac_target_ceiling_boost = 0;
 
 	ast_verb(2, "[%s] Reopening UAC sound card\n", PVT_ID(pvt));
 
@@ -502,11 +535,10 @@ static void disconnect_quectel (struct pvt* pvt)
 	}
 	at_queue_flush(pvt);
 	pvt->last_dialed_cpvt = NULL;
-        if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) {
-	if (pvt->icard) snd_pcm_close(pvt->icard);
-	if (pvt->ocard)	snd_pcm_close(pvt->ocard);
-                                                       }
-	else closetty (pvt->audio_fd, &pvt->alock);
+	if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0)
+		soundcard_close(pvt);
+	else
+		closetty (pvt->audio_fd, &pvt->alock);
 
 	closetty (pvt->data_fd, &pvt->dlock);
 
@@ -749,6 +781,30 @@ static void* do_monitor_phone (void* data)
 			ecmd = at_queue_head_cmd (pvt);
 			if(ecmd)
 			{
+				if (ecmd->cmd == CMD_AT_DTMF)
+				{
+					const at_queue_task_t *task = at_queue_head_task(pvt);
+					struct cpvt *dtmf_cpvt = task ? task->cpvt : NULL;
+
+					ast_log (LOG_WARNING, "[%s] timedout while waiting '%s' in response to '%s', treating DTMF as failed and keeping call alive\n",
+						dev, at_res2str (ecmd->res), at_cmd2str (ecmd->cmd));
+
+					if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") == 0)
+					{
+						pvt->uac_diag_dtmf_send_err++;
+						if (!dtmf_cpvt || dtmf_cpvt == &pvt->sys_chan)
+							pvt->uac_diag_dtmf_send_err_sys++;
+						else if (!dtmf_cpvt->channel)
+							pvt->uac_diag_dtmf_send_err_late++;
+					}
+
+					at_queue_handle_result(pvt, ecmd->res + 1);
+					if (at_queue_run(pvt))
+						goto e_cleanup;
+					ast_mutex_unlock (&pvt->lock);
+					continue;
+				}
+
 				ast_log (LOG_ERROR, "[%s] timedout while waiting '%s' in response to '%s'\n", dev, at_res2str (ecmd->res), at_cmd2str (ecmd->cmd));
 				goto e_cleanup;
 			}

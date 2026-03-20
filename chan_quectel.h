@@ -168,7 +168,11 @@ typedef struct pvt
 	unsigned int	uac_rx_plc_left:2;		/*!< remaining downlink PLC frames */
 	unsigned int	uac_rx_fadein_left:2;		/*!< fade-in frames after RX gap/recovery */
 	unsigned int	uac_target_frames:3;		/*!< adaptive target buffering depth, in 20ms frames */
-	unsigned int	uac_stable_ticks;		/*!< consecutive stable 20ms ticks */
+	unsigned int	uac_floor_frames:3;		/*!< short-lived playback protection floor, in 20ms frames */
+	unsigned int	uac_stable_ticks;		/*!< consecutive stable 20ms ticks for target decay */
+	unsigned int	uac_floor_stable_ticks;		/*!< consecutive stable 20ms ticks for floor decay */
+	unsigned int	uac_decay_hold_ticks;		/*!< time to hold playback floor before decaying, in 20ms ticks */
+	unsigned int	uac_target_ceiling_boost:2;	/*!< temporary TX-stress ceiling boost above base target ceiling */
 	unsigned int	uac_diag_dtmf_begin;		/*!< DTMF begin events in current UAC call */
 	unsigned int	uac_diag_dtmf_drop_pending;	/*!< pending queued DTMF dropped on hangup */
 	unsigned int	uac_diag_dtmf_send_ok;		/*!< modem acknowledged DTMF send */
@@ -186,6 +190,9 @@ typedef struct pvt
 	unsigned int	uac_diag_playback_prepare;	/*!< playback prepare attempts */
 	unsigned int	uac_diag_playback_avail_recover;	/*!< playback avail recover attempts */
 	unsigned int	uac_diag_playback_write_recover;	/*!< playback write recover attempts */
+	unsigned int	uac_diag_runtime_reopen;	/*!< runtime-triggered UAC sound card reopen attempts */
+	unsigned int	uac_capture_bad_ticks;	/*!< consecutive capture-side ALSA faults/recoveries */
+	unsigned int	uac_playback_bad_ticks;	/*!< consecutive playback-side ALSA faults/recoveries */
 	unsigned int	uac_diag_capture_degraded_ticks;	/*!< capture tick reported degraded */
 	unsigned int	uac_diag_playback_degraded_ticks;	/*!< playback tick reported degraded */
 	unsigned int	uac_diag_playback_plc_ticks;	/*!< playback tick used short PLC frame because TX queue was empty */
