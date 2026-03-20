@@ -48,6 +48,15 @@ static void uac_diag_mark_answered(struct pvt *pvt, struct cpvt *cpvt, const cha
 static void uac_diag_note_rx_enqueue(struct pvt *pvt);
 static void uac_diag_log_summary_once(struct pvt *pvt, struct cpvt *cpvt, const char *reason);
 static void uac_diag_note_rx_delivery(struct pvt *pvt, int degraded, int kind, struct ast_frame *out);
+static int uac_runtime_fault(struct pvt *pvt, unsigned int *counter, const char *reason, int reopen_now);
+static void uac_runtime_ok(unsigned int *counter);
+static unsigned int uac_playback_floor_frames(const struct pvt *pvt);
+static unsigned int uac_tx_queue_keep_frames(const struct pvt *pvt);
+static unsigned int uac_target_ceiling(const struct pvt *pvt);
+static void uac_raise_target(struct pvt *pvt, const char *reason);
+static void uac_raise_target_to(struct pvt *pvt, unsigned int target_frames, const char *reason);
+static void uac_raise_floor(struct pvt *pvt, unsigned int floor_frames, unsigned int hold_ticks,
+		unsigned int ceiling_boost, const char *reason);
 
 #define UAC_DIAG_SUMMARY_LEVEL 2
 #define UAC_DIAG_EVENT_LEVEL 3
@@ -59,6 +68,20 @@ static void uac_diag_note_rx_delivery(struct pvt *pvt, int degraded, int kind, s
 #define UAC_TX_DTMF_CONCEAL_MAX_MS 320U
 #define UAC_TX_DTMF_CONCEAL_ATTEN_NUM 7U
 #define UAC_TX_DTMF_CONCEAL_ATTEN_DEN 8U
+#define UAC_RUNTIME_FAULT_REOPEN_THRESHOLD 3U
+#define UAC_TARGET_DECAY_TICKS_HIGH 12U
+#define UAC_TARGET_DECAY_TICKS_LOW 20U
+#define UAC_FLOOR_HOLD_TICKS_DTMF 8U
+#define UAC_FLOOR_HOLD_TICKS_PREPARE 80U
+#define UAC_FLOOR_HOLD_TICKS_MILD 36U
+#define UAC_FLOOR_HOLD_TICKS_SEVERE 45U
+#define UAC_FLOOR_DECAY_TICKS_HIGH 40U
+#define UAC_FLOOR_DECAY_TICKS_LOW 260U
+#define UAC_TX_ACTIVE_GAP_MS 180U
+#define UAC_TARGET_QUEUE_GAP_MS 80U
+#define UAC_TARGET_QUEUE_STRESS_GAP_MS 140U
+#define UAC_TARGET_BOOST_GAP_MS 120U
+#define UAC_TARGET_BOOST_SEVERE_GAP_MS 220U
 
 #define UAC_DIAG_RX_KIND_NORMAL  0
 #define UAC_DIAG_RX_KIND_PLC     1
@@ -581,6 +604,7 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 	UAC_DIAG_SUMMARY(pvt,
 		"summary pcm capture_prepare=%u capture_start=%u capture_avail_recover=%u capture_read_recover=%u "
 		"capture_degraded=%u playback_prepare=%u playback_avail_recover=%u playback_write_recover=%u "
+		"runtime_reopen=%u capture_bad_ticks=%u playback_bad_ticks=%u "
 		"playback_degraded=%u playback_plc=%u playback_hold=%u playback_silence=%u playback_short_write=%u "
 		"playback_degraded_dtmf=%u playback_plc_dtmf=%u playback_hold_dtmf=%u playback_silence_dtmf=%u",
 		pvt->uac_diag_capture_prepare,
@@ -591,6 +615,9 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 		pvt->uac_diag_playback_prepare,
 		pvt->uac_diag_playback_avail_recover,
 		pvt->uac_diag_playback_write_recover,
+		pvt->uac_diag_runtime_reopen,
+		pvt->uac_capture_bad_ticks,
+		pvt->uac_playback_bad_ticks,
 		pvt->uac_diag_playback_degraded_ticks,
 		pvt->uac_diag_playback_plc_ticks,
 		pvt->uac_diag_playback_hold_ticks,
@@ -603,14 +630,19 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 
 	UAC_DIAG_SUMMARY(pvt,
 		"summary last last_state=%u last_avail=%ld last_queued=%lu last_want=%lu last_tx_rb_frames=%u "
-		"last_left=%lu last_gap_ms=%u",
+		"last_left=%lu last_gap_ms=%u target=%u floor=%u floor_hold=%u floor_stable=%u ceiling_boost=%u",
 		pvt->uac_diag_playback_last_state,
 		(long)pvt->uac_diag_playback_last_avail,
 		(unsigned long)pvt->uac_diag_playback_last_queued,
 		(unsigned long)pvt->uac_diag_playback_last_want_fill,
 		pvt->uac_diag_playback_last_tx_rb_frames,
 		(unsigned long)pvt->uac_diag_playback_last_left,
-		pvt->uac_diag_playback_last_gap_ms);
+		pvt->uac_diag_playback_last_gap_ms,
+		pvt->uac_target_frames,
+		uac_playback_floor_frames(pvt),
+		pvt->uac_decay_hold_ticks,
+		pvt->uac_floor_stable_ticks,
+		pvt->uac_target_ceiling_boost);
 }
 
 #/* we has 2 case of call this function, when local side want terminate call and when called for cleanup after remote side alreay terminate call, CEND received and cpvt destroyed */
@@ -703,9 +735,8 @@ static int channel_digit_begin (struct ast_channel* channel, char digit)
 
 	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") == 0) {
 		pvt->uac_diag_dtmf_begin++;
-		if (pvt->uac_target_frames < 2)
-			pvt->uac_target_frames = 2;
-		pvt->uac_stable_ticks = 0;
+		uac_raise_floor(pvt, 2U, UAC_FLOOR_HOLD_TICKS_DTMF, 0, "dtmf");
+		uac_raise_target(pvt, "dtmf");
 		pvt->uac_diag_last_dtmf_begin = ast_tvnow();
 		UAC_DIAG_EVENT(pvt, "DTMF begin digit=%c call_idx=%d target=%u",
 			digit, cpvt->call_idx, pvt->uac_target_frames);
@@ -920,7 +951,7 @@ static unsigned int uac_queue_capacity_frames(const struct pvt *pvt)
 	return (tx < rx) ? tx : rx;
 }
 
-static unsigned int uac_target_ceiling(const struct pvt *pvt)
+static unsigned int uac_target_base_ceiling(const struct pvt *pvt)
 {
 	unsigned int limit = uac_queue_capacity_frames(pvt);
 	unsigned int pcm_limit;
@@ -952,13 +983,89 @@ static unsigned int uac_target_ceiling(const struct pvt *pvt)
 	return limit;
 }
 
+static unsigned int uac_target_boost_ceiling(const struct pvt *pvt)
+{
+	unsigned int limit = uac_queue_capacity_frames(pvt);
+	unsigned int pcm_limit;
+
+	if (limit > 1)
+		limit -= 1;
+
+	if (pvt->uac_playback_buffer > FRAME_SIZE2) {
+		pcm_limit = (unsigned int)(pvt->uac_playback_buffer / FRAME_SIZE2);
+		if (pcm_limit > 2) {
+			pcm_limit -= 2;
+			if (pcm_limit < limit)
+				limit = pcm_limit;
+		}
+	}
+
+	if (limit < 4)
+		limit = 4;
+
+	return limit;
+}
+
+static unsigned int uac_playback_floor_frames(const struct pvt *pvt)
+{
+	unsigned int floor = pvt->uac_floor_frames ? pvt->uac_floor_frames : 1U;
+	unsigned int ceiling = uac_target_ceiling(pvt);
+
+	if (floor > ceiling)
+		floor = ceiling;
+	if (floor < 1U)
+		floor = 1U;
+
+	return floor;
+}
+
+static unsigned int uac_tx_queue_keep_frames(const struct pvt *pvt)
+{
+	unsigned int keep = 2U;
+	unsigned int cap = uac_queue_capacity_frames(pvt);
+
+	if (uac_playback_floor_frames(pvt) >= 3U ||
+	    pvt->uac_target_frames >= 5U ||
+	    pvt->uac_target_ceiling_boost)
+		keep = 3U;
+
+	if (keep > cap)
+		keep = cap;
+	if (keep < 2U)
+		keep = 2U;
+
+	return keep;
+}
+
+static unsigned int uac_target_ceiling(const struct pvt *pvt)
+{
+	unsigned int limit = uac_target_base_ceiling(pvt);
+
+	if (pvt->uac_target_ceiling_boost) {
+		unsigned int boosted = limit + pvt->uac_target_ceiling_boost;
+		unsigned int boosted_limit = uac_target_boost_ceiling(pvt);
+
+		if (boosted > boosted_limit)
+			boosted = boosted_limit;
+		if (boosted > limit)
+			limit = boosted;
+	}
+
+	return limit;
+}
+
 static snd_pcm_uframes_t uac_pcm_target_fill(const struct pvt *pvt)
 {
 	snd_pcm_uframes_t period = pvt->uac_playback_period ? pvt->uac_playback_period : FRAME_SIZE2;
 	snd_pcm_uframes_t buffer = pvt->uac_playback_buffer ? pvt->uac_playback_buffer : (period * 4);
+	unsigned int target_frames = pvt->uac_target_frames ? pvt->uac_target_frames : 1U;
+	unsigned int floor_frames = uac_playback_floor_frames(pvt);
 	snd_pcm_uframes_t want;
 
-	want = period * (pvt->uac_target_frames ? pvt->uac_target_frames : 1);
+	if (target_frames < floor_frames)
+		target_frames = floor_frames;
+
+	want = period * target_frames;
 	if (want < period)
 		want = period;
 	if (buffer > period && want > buffer - period)
@@ -1001,6 +1108,19 @@ static unsigned int uac_diag_ms_since_last_rx(struct pvt *pvt)
 	if (ms < 0)
 		ms = 0;
 	return (unsigned int)ms;
+}
+
+static int uac_tx_expect_media(struct pvt *pvt, unsigned int gap_ms)
+{
+	if (!pvt->uac_diag_tx_started || !pvt->uac_have_last_tx)
+		return 0;
+
+	if (uac_diag_is_post_answer(pvt) &&
+	    uac_diag_in_dtmf_window(pvt) &&
+	    gap_ms <= UAC_TX_DTMF_CONCEAL_MAX_MS)
+		return 1;
+
+	return gap_ms <= UAC_TX_ACTIVE_GAP_MS;
 }
 
 static void uac_diag_note_tx_enqueue(struct pvt *pvt)
@@ -1176,18 +1296,20 @@ static void uac_diag_playback_note(struct pvt *pvt, const char *reason,
 	if (pvt->uac_diag_playback_degraded_logs < 12 || (seen % 100U) == 0U) {
 		if (gap_ms > UAC_DIAG_GAP_WARN_MS || (reason && !strcmp(reason, "short-write"))) {
 			UAC_DIAG_EVENT(pvt,
-				"playback degraded reason=%s state=%d avail=%ld queued=%lu want=%lu tx_rb_frames=%u have_last_tx=%u tx_plc_left=%u left=%lu target=%u gap=%u",
+				"playback degraded reason=%s state=%d avail=%ld queued=%lu want=%lu tx_rb_frames=%u have_last_tx=%u tx_plc_left=%u left=%lu target=%u floor=%u floor_hold=%u gap=%u",
 				reason ? reason : "unknown", (int)state, (long)avail,
 				(unsigned long)queued, (unsigned long)want_fill, tx_rb_frames,
 				pvt->uac_have_last_tx ? 1U : 0U, pvt->uac_tx_plc_left,
-				(unsigned long)left, pvt->uac_target_frames, gap_ms);
+				(unsigned long)left, pvt->uac_target_frames,
+				uac_playback_floor_frames(pvt), pvt->uac_decay_hold_ticks, gap_ms);
 		} else {
 			UAC_DIAG_DETAIL(pvt,
-				"playback degraded reason=%s state=%d avail=%ld queued=%lu want=%lu tx_rb_frames=%u have_last_tx=%u tx_plc_left=%u left=%lu target=%u gap=%u",
+				"playback degraded reason=%s state=%d avail=%ld queued=%lu want=%lu tx_rb_frames=%u have_last_tx=%u tx_plc_left=%u left=%lu target=%u floor=%u floor_hold=%u gap=%u",
 				reason ? reason : "unknown", (int)state, (long)avail,
 				(unsigned long)queued, (unsigned long)want_fill, tx_rb_frames,
 				pvt->uac_have_last_tx ? 1U : 0U, pvt->uac_tx_plc_left,
-				(unsigned long)left, pvt->uac_target_frames, gap_ms);
+				(unsigned long)left, pvt->uac_target_frames,
+				uac_playback_floor_frames(pvt), pvt->uac_decay_hold_ticks, gap_ms);
 		}
 		pvt->uac_diag_playback_degraded_logs++;
 	}
@@ -1212,6 +1334,9 @@ static void uac_diag_reset(struct pvt *pvt)
 	pvt->uac_diag_playback_prepare = 0;
 	pvt->uac_diag_playback_avail_recover = 0;
 	pvt->uac_diag_playback_write_recover = 0;
+	pvt->uac_diag_runtime_reopen = 0;
+	pvt->uac_capture_bad_ticks = 0;
+	pvt->uac_playback_bad_ticks = 0;
 	pvt->uac_diag_capture_degraded_ticks = 0;
 	pvt->uac_diag_playback_degraded_ticks = 0;
 	pvt->uac_diag_playback_plc_ticks = 0;
@@ -1286,27 +1411,163 @@ static void uac_diag_reset(struct pvt *pvt)
 
 static void uac_raise_target(struct pvt *pvt, const char *reason)
 {
-	unsigned int old = pvt->uac_target_frames;
+	unsigned int floor = uac_playback_floor_frames(pvt);
+	unsigned int target = pvt->uac_target_frames ? pvt->uac_target_frames : 1U;
+
+	if (target < floor)
+		target = floor;
+	else
+		target++;
+
+	uac_raise_target_to(pvt, target, reason);
+}
+
+static void uac_raise_target_to(struct pvt *pvt, unsigned int target_frames, const char *reason)
+{
+	unsigned int old = pvt->uac_target_frames ? pvt->uac_target_frames : 1U;
+	unsigned int floor = uac_playback_floor_frames(pvt);
 	unsigned int ceiling = uac_target_ceiling(pvt);
 
-	if (pvt->uac_target_frames < ceiling)
-		pvt->uac_target_frames++;
+	if (target_frames < floor)
+		target_frames = floor;
+	if (target_frames > ceiling)
+		target_frames = ceiling;
+
+	if (pvt->uac_target_frames < target_frames)
+		pvt->uac_target_frames = target_frames;
+
+	if (pvt->uac_target_frames < floor)
+		pvt->uac_target_frames = floor;
+
 	pvt->uac_stable_ticks = 0;
 	if (old != pvt->uac_target_frames)
 		ast_debug(3, "[%s] UAC adaptive target -> %u frame(s) (%s)\n",
 			PVT_ID(pvt), pvt->uac_target_frames, reason ? reason : "event");
 }
 
+static void uac_raise_floor(struct pvt *pvt, unsigned int floor_frames, unsigned int hold_ticks,
+		unsigned int ceiling_boost, const char *reason)
+{
+	unsigned int old_floor = uac_playback_floor_frames(pvt);
+
+	if (ceiling_boost > pvt->uac_target_ceiling_boost) {
+		pvt->uac_target_ceiling_boost = ceiling_boost;
+		ast_debug(3, "[%s] UAC adaptive ceiling -> +%u frame(s) (%s)\n",
+			PVT_ID(pvt), pvt->uac_target_ceiling_boost, reason ? reason : "floor");
+	}
+
+	if (floor_frames < 1U)
+		floor_frames = 1U;
+	if (floor_frames > uac_target_ceiling(pvt))
+		floor_frames = uac_target_ceiling(pvt);
+
+	if (pvt->uac_floor_frames < floor_frames)
+		pvt->uac_floor_frames = floor_frames;
+	if (hold_ticks > pvt->uac_decay_hold_ticks)
+		pvt->uac_decay_hold_ticks = hold_ticks;
+
+	pvt->uac_floor_stable_ticks = 0;
+	pvt->uac_stable_ticks = 0;
+
+	if (old_floor != uac_playback_floor_frames(pvt))
+		ast_debug(3, "[%s] UAC adaptive floor -> %u frame(s) (%s)\n",
+			PVT_ID(pvt), uac_playback_floor_frames(pvt), reason ? reason : "event");
+}
+
+static void uac_note_tx_stress(struct pvt *pvt, unsigned int gap_ms, int severe,
+		int allow_boost, const char *reason)
+{
+	unsigned int floor_frames = 2U;
+	unsigned int hold_ticks = UAC_FLOOR_HOLD_TICKS_MILD;
+	unsigned int boost = 0;
+
+	if (gap_ms >= UAC_TARGET_BOOST_SEVERE_GAP_MS || severe)
+		floor_frames = 3U;
+	if (gap_ms >= UAC_TARGET_BOOST_SEVERE_GAP_MS || severe)
+		hold_ticks = UAC_FLOOR_HOLD_TICKS_SEVERE;
+	else if (gap_ms >= UAC_TARGET_BOOST_GAP_MS)
+		hold_ticks = UAC_FLOOR_HOLD_TICKS_MILD + 8U;
+
+	if (allow_boost && (gap_ms >= UAC_TARGET_BOOST_SEVERE_GAP_MS || severe))
+		boost = 1;
+
+	if (!uac_diag_is_post_answer(pvt))
+		boost = 0;
+
+	uac_raise_floor(pvt, floor_frames, hold_ticks, boost, reason ? reason : "stress");
+}
+
+static void uac_note_tx_backpressure(struct pvt *pvt)
+{
+	unsigned int floor = uac_playback_floor_frames(pvt);
+
+	if (pvt->uac_target_frames > floor) {
+		pvt->uac_target_frames = floor;
+		ast_debug(3, "[%s] UAC adaptive target -> %u frame(s) (tx backpressure)\n",
+			PVT_ID(pvt), pvt->uac_target_frames);
+	}
+
+	if (pvt->uac_target_ceiling_boost)
+		pvt->uac_target_ceiling_boost = 0;
+
+	pvt->uac_stable_ticks = 0;
+}
+
 static void uac_note_stable_tick(struct pvt *pvt)
 {
-	if (pvt->uac_target_frames <= 1)
-		return;
+	unsigned int floor = uac_playback_floor_frames(pvt);
+	unsigned int decay_ticks;
 
-	if (++pvt->uac_stable_ticks >= 100) {
-		pvt->uac_target_frames--;
-		pvt->uac_stable_ticks = 0;
-		ast_debug(3, "[%s] UAC adaptive target -> %u frame(s) (stable)\n",
-			PVT_ID(pvt), pvt->uac_target_frames);
+	if (pvt->uac_target_frames < floor)
+		pvt->uac_target_frames = floor;
+
+	if (pvt->uac_target_frames > floor) {
+		decay_ticks = (pvt->uac_target_frames >= floor + 2U) ?
+			UAC_TARGET_DECAY_TICKS_HIGH : UAC_TARGET_DECAY_TICKS_LOW;
+
+		if (++pvt->uac_stable_ticks >= decay_ticks) {
+			pvt->uac_target_frames--;
+			if (pvt->uac_target_frames < floor)
+				pvt->uac_target_frames = floor;
+			pvt->uac_stable_ticks = 0;
+			if (pvt->uac_target_frames <= floor)
+				pvt->uac_target_ceiling_boost = 0;
+			ast_debug(3, "[%s] UAC adaptive target -> %u frame(s) (stable %u ticks)\n",
+				PVT_ID(pvt), pvt->uac_target_frames, decay_ticks);
+		}
+		pvt->uac_floor_stable_ticks = 0;
+		return;
+	}
+
+	pvt->uac_stable_ticks = 0;
+
+	if (pvt->uac_decay_hold_ticks > 0) {
+		pvt->uac_decay_hold_ticks--;
+		pvt->uac_floor_stable_ticks = 0;
+		return;
+	}
+
+	if (floor <= 1U) {
+		pvt->uac_floor_frames = 1U;
+		pvt->uac_floor_stable_ticks = 0;
+		pvt->uac_target_ceiling_boost = 0;
+		return;
+	}
+
+	decay_ticks = (floor >= 3U) ?
+		UAC_FLOOR_DECAY_TICKS_HIGH : UAC_FLOOR_DECAY_TICKS_LOW;
+
+	if (++pvt->uac_floor_stable_ticks >= decay_ticks) {
+		pvt->uac_floor_frames--;
+		if (pvt->uac_floor_frames < 1U)
+			pvt->uac_floor_frames = 1U;
+		pvt->uac_floor_stable_ticks = 0;
+		if (pvt->uac_target_frames < pvt->uac_floor_frames)
+			pvt->uac_target_frames = pvt->uac_floor_frames;
+		if (pvt->uac_floor_frames <= 2U)
+			pvt->uac_target_ceiling_boost = 0;
+		ast_debug(3, "[%s] UAC adaptive floor -> %u frame(s) (stable %u ticks)\n",
+			PVT_ID(pvt), pvt->uac_floor_frames, decay_ticks);
 	}
 }
 
@@ -1418,12 +1679,73 @@ static void uac_fadein_frame(char *frame, unsigned int fade_left)
 	for (i = 0; i < FRAME_SIZE2; ++i)
 		samples[i] = (short)((samples[i] * mul) / div);
 }
-static void uac_trim_queue(struct ringbuffer *rb, size_t keep_bytes)
+static void uac_trim_tx_queue(struct pvt *pvt, size_t keep_bytes, const char *reason)
 {
 	if (keep_bytes < FRAME_SIZE)
 		keep_bytes = FRAME_SIZE;
-	while (rb_used(rb) > keep_bytes && rb_used(rb) >= FRAME_SIZE)
-		rb_read_upd(rb, FRAME_SIZE);
+
+	while (rb_used(&pvt->uac_tx_rb) > keep_bytes &&
+	       rb_used(&pvt->uac_tx_rb) >= FRAME_SIZE) {
+		rb_read_upd(&pvt->uac_tx_rb, FRAME_SIZE);
+		pvt->uac_diag_tx_rb_drop++;
+		ast_verb(4, "[%s] UAC diag TX trim old frame keep=%lu target=%u floor=%u reason=%s used=%lu\n",
+			PVT_ID(pvt), (unsigned long)(keep_bytes / FRAME_SIZE), pvt->uac_target_frames,
+			uac_playback_floor_frames(pvt), reason ? reason : "trim",
+			(unsigned long)rb_used(&pvt->uac_tx_rb));
+	}
+}
+
+static void uac_runtime_ok(unsigned int *counter)
+{
+	*counter = 0;
+}
+
+static int uac_runtime_fault(struct pvt *pvt, unsigned int *counter, const char *reason, int reopen_now)
+{
+	unsigned int saved_target;
+	unsigned int saved_floor;
+
+	if (*counter != ~0U)
+		(*counter)++;
+
+	UAC_DIAG_EVENT(pvt, "runtime fault reason=%s streak=%u reopen=%u",
+		reason ? reason : "unknown", *counter, reopen_now ? 1U : 0U);
+	uac_raise_floor(pvt, 2U, UAC_FLOOR_HOLD_TICKS_SEVERE, 0,
+		reason ? reason : "runtime fault");
+	uac_raise_target(pvt, reason ? reason : "runtime fault");
+	saved_target = pvt->uac_target_frames;
+	saved_floor = uac_playback_floor_frames(pvt);
+
+	if (reopen_now || *counter >= UAC_RUNTIME_FAULT_REOPEN_THRESHOLD) {
+		pvt->uac_diag_runtime_reopen++;
+		UAC_DIAG_EVENT(pvt, "runtime reopen reason=%s count=%u",
+			reason ? reason : "unknown", pvt->uac_diag_runtime_reopen);
+		if (soundcard_reopen(pvt) < 0)
+			ast_log(LOG_ERROR, "[%s] UAC runtime reopen failed after %s\n",
+				PVT_ID(pvt), reason ? reason : "runtime fault");
+		else {
+			unsigned int ceiling = uac_target_ceiling(pvt);
+			if (saved_floor < 2U)
+				saved_floor = 2U;
+			if (saved_floor > ceiling)
+				saved_floor = ceiling;
+			pvt->uac_floor_frames = saved_floor;
+			pvt->uac_floor_stable_ticks = 0;
+			pvt->uac_decay_hold_ticks = UAC_FLOOR_HOLD_TICKS_SEVERE;
+			if (saved_target < saved_floor)
+				saved_target = saved_floor;
+			if (saved_target > ceiling)
+				saved_target = ceiling;
+			if (pvt->uac_target_frames < saved_target)
+				pvt->uac_target_frames = saved_target;
+			pvt->uac_stable_ticks = 0;
+		}
+		pvt->uac_capture_bad_ticks = 0;
+		pvt->uac_playback_bad_ticks = 0;
+		pvt->uac_rx_fadein_left = 2;
+	}
+
+	return 1;
 }
 
 static void uac_reset_runtime(struct pvt *pvt)
@@ -1442,7 +1764,11 @@ static void uac_reset_runtime(struct pvt *pvt)
 	pvt->uac_rx_plc_left = 0;
 	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
+	pvt->uac_floor_frames = 1;
 	pvt->uac_stable_ticks = 0;
+	pvt->uac_floor_stable_ticks = 0;
+	pvt->uac_decay_hold_ticks = 0;
+	pvt->uac_target_ceiling_boost = 0;
 	uac_diag_reset(pvt);
 }
 
@@ -1450,23 +1776,41 @@ static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
 {
 	char frame[FRAME_SIZE];
 	size_t copy = len > FRAME_SIZE ? FRAME_SIZE : len;
-	size_t keep = (size_t)(pvt->uac_target_frames + 2) * FRAME_SIZE;
+	size_t keep = (size_t)uac_tx_queue_keep_frames(pvt) * FRAME_SIZE;
+	unsigned int gap_ms = pvt->uac_diag_tx_started ? uac_diag_ms_since_last_tx(pvt) : 0U;
+	unsigned int queued_frames = (unsigned int)(rb_used(&pvt->uac_tx_rb) / FRAME_SIZE);
+	unsigned int floor_frames = uac_playback_floor_frames(pvt);
 
 	memset(frame, 0, sizeof(frame));
 	memcpy(frame, data, copy);
 	uac_diag_note_tx_enqueue(pvt);
+	if (gap_ms >= UAC_TARGET_QUEUE_GAP_MS &&
+	    queued_frames == 0U &&
+	    uac_tx_expect_media(pvt, gap_ms)) {
+		if (gap_ms >= UAC_TARGET_QUEUE_STRESS_GAP_MS)
+			uac_note_tx_stress(pvt, gap_ms, 0, 0,
+				gap_ms > UAC_DIAG_GAP_WARN_MS ? "tx gap" : "tx jitter");
+		if (gap_ms >= UAC_TARGET_BOOST_GAP_MS) {
+			unsigned int target = floor_frames + ((gap_ms >= UAC_TARGET_BOOST_SEVERE_GAP_MS) ? 2U : 1U);
+			uac_raise_target_to(pvt, target,
+				gap_ms > UAC_DIAG_GAP_WARN_MS ? "tx gap" : "tx jitter");
+		} else if (pvt->uac_target_frames < floor_frames + 1U) {
+			uac_raise_target_to(pvt, floor_frames + 1U, "tx jitter");
+		}
+	}
 
 	if (pvt->uac_have_last_tx)
 		uac_sanitize_edge_from_prev(pvt->uac_last_tx_frame, frame, pvt->uac_tx_plc_left != 0);
 
 	while (rb_free(&pvt->uac_tx_rb) < FRAME_SIZE) {
 		rb_read_upd(&pvt->uac_tx_rb, FRAME_SIZE);
+		uac_note_tx_backpressure(pvt);
 		pvt->uac_diag_tx_rb_drop++;
 		ast_verb(3, "[%s] UAC diag TX rb drop old frame target=%u used=%lu\n",
 			PVT_ID(pvt), pvt->uac_target_frames, (unsigned long)rb_used(&pvt->uac_tx_rb));
 	}
 	rb_write(&pvt->uac_tx_rb, frame, FRAME_SIZE);
-	uac_trim_queue(&pvt->uac_tx_rb, keep);
+	uac_trim_tx_queue(pvt, keep, "freshness");
 
 	memcpy(pvt->uac_last_tx_frame, frame, FRAME_SIZE);
 	pvt->uac_have_last_tx = 1;
@@ -1498,6 +1842,7 @@ static int uac_capture_drain(struct pvt *pvt)
 	int loops = 0;
 	int degraded = 0;
 	int max_loops = 8;
+	int captured = 0;
 
 	if (pvt->uac_capture_buffer > FRAME_SIZE2) {
 		unsigned int buffer_frames = (unsigned int)(pvt->uac_capture_buffer / FRAME_SIZE2);
@@ -1513,16 +1858,22 @@ static int uac_capture_drain(struct pvt *pvt)
 		snd_pcm_uframes_t want;
 		int r;
 
+		if (!pvt->icard)
+			return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture missing", 1);
+
 		state = snd_pcm_state(pvt->icard);
 		if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
+			if (state == SND_PCM_STATE_DISCONNECTED || state == SND_PCM_STATE_SUSPENDED) {
+				UAC_DIAG_EVENT(pvt, "capture fatal state=%d", state);
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture state", 1);
+			}
 			pvt->uac_diag_capture_prepare++;
 			UAC_DIAG_EVENT(pvt, "capture prepare state=%d", state);
 			r = snd_pcm_prepare(pvt->icard);
 			if (r < 0) {
 				ast_log(LOG_ERROR, "Unable to prepare capture PCM: %s\n", snd_strerror(r));
 				pvt->uac_rx_fadein_left = 2;
-				uac_raise_target(pvt, "capture prepare");
-				return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture prepare", 1);
 			}
 			state = snd_pcm_state(pvt->icard);
 		}
@@ -1533,8 +1884,7 @@ static int uac_capture_drain(struct pvt *pvt)
 			if (r < 0 && r != -EBUSY) {
 				ast_log(LOG_ERROR, "Unable to start capture PCM: %s\n", snd_strerror(r));
 				pvt->uac_rx_fadein_left = 2;
-				uac_raise_target(pvt, "capture start");
-				return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture start", 1);
 			}
 		}
 
@@ -1549,10 +1899,11 @@ static int uac_capture_drain(struct pvt *pvt)
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 			pvt->uac_rx_fadein_left = 2;
-			if (rec < 0)
+			if (rec < 0) {
 				ast_log(LOG_ERROR, "Capture avail recover failed: %s\n", snd_strerror(rec));
-			uac_raise_target(pvt, "capture recover");
-			return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture recover", 1);
+			}
+			return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture recover", 0);
 		}
 
 		want = pvt->uac_readleft;
@@ -1572,11 +1923,12 @@ static int uac_capture_drain(struct pvt *pvt)
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 			pvt->uac_rx_fadein_left = 2;
-			if (rec < 0)
+			if (rec < 0) {
 				ast_log(LOG_ERROR, "Read recover failed: read=%s recover=%s\n",
 					snd_strerror(r), snd_strerror(rec));
-			uac_raise_target(pvt, "capture read");
-			return 1;
+				return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture read", 1);
+			}
+			return uac_runtime_fault(pvt, &pvt->uac_capture_bad_ticks, "capture read", 0);
 		}
 
 		pvt->uac_readpos += r;
@@ -1587,7 +1939,11 @@ static int uac_capture_drain(struct pvt *pvt)
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
 		}
+		captured = 1;
 	}
+
+	if (captured)
+		uac_runtime_ok(&pvt->uac_capture_bad_ticks);
 
 	return degraded;
 }
@@ -1598,6 +1954,7 @@ static int uac_playback_tick(struct pvt *pvt)
 {
 	char frame[FRAME_SIZE];
 	int degraded = 0;
+	int wrote = 0;
 	snd_pcm_state_t state;
 	snd_pcm_sframes_t avail;
 	snd_pcm_uframes_t queued = 0;
@@ -1605,17 +1962,27 @@ static int uac_playback_tick(struct pvt *pvt)
 	unsigned int loops = 0;
 	unsigned int max_loops;
 
+	if (!pvt->ocard)
+		return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback missing", 1);
+
 	state = snd_pcm_state(pvt->ocard);
 	if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
 		int r;
+		if (state == SND_PCM_STATE_DISCONNECTED || state == SND_PCM_STATE_SUSPENDED) {
+			UAC_DIAG_EVENT(pvt, "playback fatal state=%d", state);
+			return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback state", 1);
+		}
 		pvt->uac_diag_playback_prepare++;
 		UAC_DIAG_EVENT(pvt, "playback prepare state=%d", state);
 		r = snd_pcm_prepare(pvt->ocard);
 		if (r < 0) {
 			ast_log(LOG_ERROR, "Unable to prepare playback PCM: %s\n", snd_strerror(r));
-			uac_raise_target(pvt, "playback prepare");
-			return 1;
+			return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback prepare", 1);
 		}
+		uac_raise_floor(pvt, 2U, UAC_FLOOR_HOLD_TICKS_PREPARE, 0, "playback prepare");
+		uac_raise_target_to(pvt, 3U, "playback prepare");
+		degraded = 1;
+		state = snd_pcm_state(pvt->ocard);
 	}
 
 	avail = snd_pcm_avail_update(pvt->ocard);
@@ -1626,15 +1993,37 @@ static int uac_playback_tick(struct pvt *pvt)
 		pvt->uac_diag_playback_avail_recover++;
 		UAC_DIAG_EVENT(pvt, "playback avail recover avail=%ld", (long)avail);
 		rec = snd_pcm_recover(pvt->ocard, (int)avail, 1);
-		if (rec < 0)
+		if (rec < 0) {
 			ast_log(LOG_ERROR, "Playback avail recover failed: %s\n", snd_strerror(rec));
-		uac_raise_target(pvt, "playback recover");
-		return 1;
+			return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback recover", 1);
+		}
+		return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback recover", 0);
 	}
 
 	if (pvt->uac_playback_buffer && (snd_pcm_uframes_t)avail <= pvt->uac_playback_buffer)
 		queued = pvt->uac_playback_buffer - (snd_pcm_uframes_t)avail;
 	want_fill = uac_pcm_target_fill(pvt);
+	if (state != SND_PCM_STATE_RUNNING) {
+		snd_pcm_uframes_t bootstrap_fill = want_fill;
+		unsigned int bootstrap_frames = uac_playback_floor_frames(pvt);
+		snd_pcm_uframes_t floor = pvt->uac_playback_period ?
+			(pvt->uac_playback_period * bootstrap_frames) : want_fill;
+
+		if (bootstrap_fill < floor)
+			bootstrap_fill = floor;
+		if (rb_used(&pvt->uac_tx_rb) < FRAME_SIZE && pvt->uac_playback_period &&
+		    bootstrap_fill < pvt->uac_playback_period * 2)
+			bootstrap_fill = pvt->uac_playback_period * 2;
+		if (pvt->uac_playback_buffer > pvt->uac_playback_period) {
+			snd_pcm_uframes_t cap = pvt->uac_playback_buffer - pvt->uac_playback_period;
+			if (cap > pvt->uac_playback_period * 3)
+				cap = pvt->uac_playback_period * 3;
+			if (bootstrap_fill > cap)
+				bootstrap_fill = cap;
+		}
+		if (bootstrap_fill > want_fill)
+			want_fill = bootstrap_fill;
+	}
 	pvt->uac_diag_playback_last_state = (unsigned int)state;
 	pvt->uac_diag_playback_last_avail = avail;
 	pvt->uac_diag_playback_last_queued = queued;
@@ -1673,6 +2062,7 @@ static int uac_playback_tick(struct pvt *pvt)
 			pvt->uac_tx_plc_left = 2;
 		} else {
 			unsigned int gap_ms = uac_diag_ms_since_last_tx(pvt);
+			int tx_expect_media = uac_tx_expect_media(pvt, gap_ms);
 			int dtmf_hold = pvt->uac_have_last_tx && uac_diag_is_post_answer(pvt) &&
 				uac_diag_in_dtmf_window(pvt) && gap_ms <= UAC_TX_DTMF_CONCEAL_MAX_MS;
 
@@ -1692,7 +2082,7 @@ static int uac_playback_tick(struct pvt *pvt)
 				}
 				uac_diag_playback_note(pvt, "tx-hold", state, avail, queued, want_fill, 0);
 				degraded = 1;
-			} else if (pvt->uac_have_last_tx && pvt->uac_tx_plc_left > 0) {
+			} else if (tx_expect_media && pvt->uac_have_last_tx && pvt->uac_tx_plc_left > 0) {
 				memcpy(frame, pvt->uac_last_tx_frame, FRAME_SIZE);
 				uac_fade_frame(frame, pvt->uac_tx_plc_left);
 				pvt->uac_tx_plc_left--;
@@ -1705,8 +2095,13 @@ static int uac_playback_tick(struct pvt *pvt)
 						pvt->uac_diag_tx_rb_empty_gap_60ms++;
 				}
 				uac_diag_playback_note(pvt, "tx-plc", state, avail, queued, want_fill, 0);
-				uac_raise_target(pvt, "tx underrun");
+				if (pvt->uac_diag_tx_started) {
+					uac_note_tx_stress(pvt, gap_ms, gap_ms >= UAC_TARGET_BOOST_SEVERE_GAP_MS, 1, "tx underrun");
+					uac_raise_target(pvt, "tx underrun");
+				}
 				degraded = 1;
+			} else if (!tx_expect_media) {
+				memset(frame, 0, sizeof(frame));
 			} else {
 				memset(frame, 0, sizeof(frame));
 				pvt->uac_diag_playback_silence_ticks++;
@@ -1718,7 +2113,10 @@ static int uac_playback_tick(struct pvt *pvt)
 						pvt->uac_diag_tx_rb_empty_gap_60ms++;
 				}
 				uac_diag_playback_note(pvt, "tx-silence", state, avail, queued, want_fill, 0);
-				uac_raise_target(pvt, "tx silence");
+				if (pvt->uac_diag_tx_started) {
+					uac_note_tx_stress(pvt, gap_ms, gap_ms >= UAC_TARGET_BOOST_SEVERE_GAP_MS, 1, "tx silence");
+					uac_raise_target(pvt, "tx silence");
+				}
 				degraded = 1;
 			}
 		}
@@ -1734,10 +2132,11 @@ static int uac_playback_tick(struct pvt *pvt)
 				pvt->uac_diag_playback_write_recover++;
 				UAC_DIAG_EVENT(pvt, "playback write recover write=%d", r);
 				rec = snd_pcm_recover(pvt->ocard, r, 1);
-				if (rec < 0)
+				if (rec < 0) {
 					ast_log(LOG_ERROR, "Write error: %s\n", snd_strerror(rec));
-				uac_raise_target(pvt, "playback write");
-				return 1;
+					return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback write", 1);
+				}
+				return uac_runtime_fault(pvt, &pvt->uac_playback_bad_ticks, "playback write", 0);
 			}
 			if (r == 0) {
 				pvt->uac_diag_playback_short_write_breaks++;
@@ -1746,6 +2145,7 @@ static int uac_playback_tick(struct pvt *pvt)
 			}
 			left -= (snd_pcm_uframes_t)r;
 			ptr += r * 2;
+			wrote = 1;
 		}
 		if (left > 0) {
 			pvt->uac_diag_playback_short_write_breaks++;
@@ -1754,6 +2154,9 @@ static int uac_playback_tick(struct pvt *pvt)
 		}
 		queued += FRAME_SIZE2;
 	}
+
+	if (wrote)
+		uac_runtime_ok(&pvt->uac_playback_bad_ticks);
 
 	return degraded;
 }
@@ -2303,8 +2706,6 @@ e_return:
 	}
 
 	uac_queue_tx_frame(pvt, f->data.ptr, f->datalen);
-	if (rb_used(&pvt->uac_tx_rb) > (size_t)(pvt->uac_target_frames + 1) * FRAME_SIZE)
-		uac_trim_queue(&pvt->uac_tx_rb, (size_t)(pvt->uac_target_frames + 1) * FRAME_SIZE);
 
 uac_write_done:
 	ast_mutex_unlock (&pvt->lock);
