@@ -222,6 +222,16 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,struct pvt *
 	if (err < 0)
 		ast_log(LOG_ERROR, "sw_params: %s\n", snd_strerror(err));
 
+	/*
+	 * UAC media is pumped from the channel timer thread rather than a
+	 * dedicated ALSA worker. Keep the PCM handles non-blocking so transient
+	 * USB/device stalls surface as EAGAIN/recoverable errors instead of
+	 * stalling the whole media bridge.
+	 */
+	err = snd_pcm_nonblock(handle, 1);
+	if (err < 0)
+		ast_log(LOG_WARNING, "snd_pcm_nonblock failed for %s: %s\n", dev, snd_strerror(err));
+
 	err = snd_pcm_poll_descriptors_count(handle);
 	if (err <= 0) {
 		ast_log(LOG_ERROR, "Unable to get a poll descriptors count, error is %s\n", snd_strerror(err));

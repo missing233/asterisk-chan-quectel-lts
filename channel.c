@@ -82,6 +82,13 @@ static void uac_raise_floor(struct pvt *pvt, unsigned int floor_frames, unsigned
 #define UAC_TARGET_QUEUE_STRESS_GAP_MS 140U
 #define UAC_TARGET_BOOST_GAP_MS 120U
 #define UAC_TARGET_BOOST_SEVERE_GAP_MS 220U
+/*
+ * channel_read() is timer-driven and runs under pvt->lock. Keep ALSA catch-up
+ * work bounded so one delayed tick does not monopolize the bridge thread and
+ * starve SIP/RTP delivery in both directions.
+ */
+#define UAC_CAPTURE_FRAMES_PER_TICK_MAX 2U
+#define UAC_PLAYBACK_FRAMES_PER_TICK_MAX 2U
 
 #define UAC_DIAG_RX_KIND_NORMAL  0
 #define UAC_DIAG_RX_KIND_PLC     1
@@ -1850,6 +1857,7 @@ static int uac_capture_drain(struct pvt *pvt)
 	int degraded = 0;
 	int max_loops = 8;
 	int captured = 0;
+	unsigned int queued_frames = 0;
 
 	if (pvt->uac_capture_buffer > FRAME_SIZE2) {
 		unsigned int buffer_frames = (unsigned int)(pvt->uac_capture_buffer / FRAME_SIZE2);
@@ -1945,6 +1953,9 @@ static int uac_capture_drain(struct pvt *pvt)
 			pvt->uac_rx_plc_left = 2;
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
+			queued_frames++;
+			if (queued_frames >= UAC_CAPTURE_FRAMES_PER_TICK_MAX)
+				break;
 		}
 		captured = 1;
 	}
@@ -2040,8 +2051,8 @@ static int uac_playback_tick(struct pvt *pvt)
 	max_loops = (unsigned int)(want_fill / FRAME_SIZE2);
 	if (max_loops < 1)
 		max_loops = 1;
-	if (max_loops > 6)
-		max_loops = 6;
+	if (max_loops > UAC_PLAYBACK_FRAMES_PER_TICK_MAX)
+		max_loops = UAC_PLAYBACK_FRAMES_PER_TICK_MAX;
 
 	while (loops++ < max_loops) {
 		const char *ptr;
